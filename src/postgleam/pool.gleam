@@ -2,6 +2,7 @@
 /// Checkout/checkin pattern for concurrent access.
 
 import gleam/erlang/process.{type Subject}
+import gleam/list
 import gleam/option.{type Option}
 import gleam/otp/actor
 import postgleam/config.{type Config}
@@ -11,6 +12,7 @@ import postgleam/connection.{
 }
 import postgleam/codec/defaults
 import postgleam/codec/registry.{type Registry}
+import postgleam/decode.{type RowDecoder}
 import postgleam/error.{type Error}
 import postgleam/value.{type Value}
 
@@ -215,7 +217,50 @@ pub fn simple_query(
   })
 }
 
+/// Execute a parameterized query through the pool and decode rows.
+pub fn query_with(
+  pool: Subject(PoolMessage),
+  sql: String,
+  params: List(Option(Value)),
+  decoder: RowDecoder(a),
+  timeout: Int,
+) -> Result(PoolResponse(a), Error) {
+  case query(pool, sql, params, timeout) {
+    Ok(result) ->
+      case decode_rows(result.rows, decoder, []) {
+        Ok(decoded) ->
+          Ok(PoolResponse(
+            rows: decoded,
+            count: list.length(decoded),
+            tag: result.tag,
+          ))
+        Error(e) -> Error(e)
+      }
+    Error(e) -> Error(e)
+  }
+}
+
+/// Result from a decoded pool query.
+pub type PoolResponse(a) {
+  PoolResponse(rows: List(a), count: Int, tag: String)
+}
+
 /// Shut down the pool, disconnecting all connections
 pub fn shutdown(pool: Subject(PoolMessage), timeout: Int) -> Nil {
   process.call(pool, timeout, fn(reply) { Shutdown(reply) })
+}
+
+fn decode_rows(
+  rows: List(List(Option(Value))),
+  decoder: RowDecoder(a),
+  acc: List(a),
+) -> Result(List(a), Error) {
+  case rows {
+    [] -> Ok(list.reverse(acc))
+    [row, ..rest] ->
+      case decode.run(decoder, row) {
+        Ok(val) -> decode_rows(rest, decoder, [val, ..acc])
+        Error(e) -> Error(e)
+      }
+  }
 }

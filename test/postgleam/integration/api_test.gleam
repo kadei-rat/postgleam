@@ -2,6 +2,8 @@ import gleam/option.{None, Some}
 import gleeunit/should
 import postgleam
 import postgleam/config
+import postgleam/decode
+import postgleam/error
 import postgleam/value
 
 fn test_config() {
@@ -147,7 +149,7 @@ pub fn transaction_commit_test() {
 
   // Transaction that succeeds
   let assert Ok(42) =
-    postgleam.transaction(conn, fn() {
+    postgleam.transaction(conn, fn(conn) {
       let assert Ok(_) =
         postgleam.query(
           conn,
@@ -175,7 +177,7 @@ pub fn transaction_rollback_test() {
 
   // Transaction that fails
   let assert Error(_) =
-    postgleam.transaction(conn, fn() {
+    postgleam.transaction(conn, fn(conn) {
       let assert Ok(_) =
         postgleam.query(
           conn,
@@ -213,6 +215,271 @@ pub fn bytea_roundtrip_test() {
   should.equal(result.rows, [[Some(value.Bytea(data))]])
   postgleam.disconnect(conn)
 }
+
+// =============================================================================
+// DX: Parameter constructors
+// =============================================================================
+
+pub fn param_constructors_test() {
+  let cfg = test_config()
+  let assert Ok(conn) = postgleam.connect(cfg)
+
+  let assert Ok(result) =
+    postgleam.query(
+      conn,
+      "SELECT $1::int4 + $2::int4 AS sum, $3::text AS name, $4::bool AS flag",
+      [postgleam.int(10), postgleam.int(32), postgleam.text("hello"), postgleam.bool(True)],
+    )
+
+  should.equal(result.rows, [
+    [Some(value.Integer(42)), Some(value.Text("hello")), Some(value.Boolean(True))],
+  ])
+  postgleam.disconnect(conn)
+}
+
+pub fn param_null_test() {
+  let cfg = test_config()
+  let assert Ok(conn) = postgleam.connect(cfg)
+
+  let assert Ok(result) =
+    postgleam.query(conn, "SELECT $1::int4 AS val", [postgleam.null()])
+
+  should.equal(result.rows, [[None]])
+  postgleam.disconnect(conn)
+}
+
+pub fn param_nullable_some_test() {
+  let cfg = test_config()
+  let assert Ok(conn) = postgleam.connect(cfg)
+
+  let assert Ok(result) =
+    postgleam.query(
+      conn,
+      "SELECT $1::text AS val",
+      [postgleam.nullable(Some("hello"), postgleam.text)],
+    )
+
+  should.equal(result.rows, [[Some(value.Text("hello"))]])
+  postgleam.disconnect(conn)
+}
+
+pub fn param_nullable_none_test() {
+  let cfg = test_config()
+  let assert Ok(conn) = postgleam.connect(cfg)
+
+  let assert Ok(result) =
+    postgleam.query(
+      conn,
+      "SELECT $1::text AS val",
+      [postgleam.nullable(None, postgleam.text)],
+    )
+
+  should.equal(result.rows, [[None]])
+  postgleam.disconnect(conn)
+}
+
+// =============================================================================
+// DX: query_with (decoder-integrated query)
+// =============================================================================
+
+pub fn query_with_single_column_test() {
+  let cfg = test_config()
+  let assert Ok(conn) = postgleam.connect(cfg)
+
+  let decoder = {
+    use n <- decode.element(0, decode.int)
+    decode.success(n)
+  }
+
+  let assert Ok(response) =
+    postgleam.query_with(conn, "SELECT 42::int4 AS num", [], decoder)
+
+  should.equal(response.rows, [42])
+  should.equal(response.count, 1)
+  should.equal(response.tag, "SELECT 1")
+  postgleam.disconnect(conn)
+}
+
+pub fn query_with_multiple_columns_test() {
+  let cfg = test_config()
+  let assert Ok(conn) = postgleam.connect(cfg)
+
+  let decoder = {
+    use id <- decode.element(0, decode.int)
+    use name <- decode.element(1, decode.text)
+    use active <- decode.element(2, decode.bool)
+    decode.success(#(id, name, active))
+  }
+
+  let assert Ok(response) =
+    postgleam.query_with(
+      conn,
+      "SELECT 1::int4, 'alice'::text, true::bool",
+      [],
+      decoder,
+    )
+
+  should.equal(response.rows, [#(1, "alice", True)])
+  postgleam.disconnect(conn)
+}
+
+pub fn query_with_multiple_rows_test() {
+  let cfg = test_config()
+  let assert Ok(conn) = postgleam.connect(cfg)
+
+  let decoder = {
+    use n <- decode.element(0, decode.int)
+    decode.success(n)
+  }
+
+  let assert Ok(response) =
+    postgleam.query_with(
+      conn,
+      "SELECT generate_series(1, 3)::int4",
+      [],
+      decoder,
+    )
+
+  should.equal(response.rows, [1, 2, 3])
+  should.equal(response.count, 3)
+  postgleam.disconnect(conn)
+}
+
+pub fn query_with_optional_column_test() {
+  let cfg = test_config()
+  let assert Ok(conn) = postgleam.connect(cfg)
+
+  let decoder = {
+    use val <- decode.element(0, decode.optional(decode.text))
+    decode.success(val)
+  }
+
+  let assert Ok(response) =
+    postgleam.query_with(conn, "SELECT NULL::text", [], decoder)
+
+  should.equal(response.rows, [None])
+  postgleam.disconnect(conn)
+}
+
+pub fn query_with_params_test() {
+  let cfg = test_config()
+  let assert Ok(conn) = postgleam.connect(cfg)
+
+  let decoder = {
+    use sum <- decode.element(0, decode.int)
+    decode.success(sum)
+  }
+
+  let assert Ok(response) =
+    postgleam.query_with(
+      conn,
+      "SELECT $1::int4 + $2::int4",
+      [postgleam.int(17), postgleam.int(25)],
+      decoder,
+    )
+
+  should.equal(response.rows, [42])
+  postgleam.disconnect(conn)
+}
+
+// =============================================================================
+// DX: query_one
+// =============================================================================
+
+pub fn query_one_test() {
+  let cfg = test_config()
+  let assert Ok(conn) = postgleam.connect(cfg)
+
+  let decoder = {
+    use n <- decode.element(0, decode.int)
+    decode.success(n)
+  }
+
+  let assert Ok(val) =
+    postgleam.query_one(conn, "SELECT 42::int4", [], decoder)
+
+  should.equal(val, 42)
+  postgleam.disconnect(conn)
+}
+
+pub fn query_one_no_rows_error_test() {
+  let cfg = test_config()
+  let assert Ok(conn) = postgleam.connect(cfg)
+
+  let assert Ok(_) =
+    postgleam.simple_query(conn, "CREATE TEMP TABLE _empty_test (id int)")
+
+  let decoder = {
+    use n <- decode.element(0, decode.int)
+    decode.success(n)
+  }
+
+  let assert Error(_) =
+    postgleam.query_one(conn, "SELECT id FROM _empty_test", [], decoder)
+
+  postgleam.disconnect(conn)
+}
+
+// =============================================================================
+// DX: connect returns Error type
+// =============================================================================
+
+pub fn connect_error_type_test() {
+  let cfg =
+    test_config()
+    |> config.username("postgleam_scram_pw")
+    |> config.password("wrong_password")
+
+  // Should return Error(Error) not Error(String)
+  let assert Error(err) = postgleam.connect(cfg)
+  // Can pattern match on the Error type
+  let _msg = case err {
+    error.ConnectionError(m) -> m
+    _ -> "other error"
+  }
+}
+
+// =============================================================================
+// DX: transaction with connection parameter
+// =============================================================================
+
+pub fn transaction_with_conn_param_test() {
+  let cfg = test_config()
+  let assert Ok(conn) = postgleam.connect(cfg)
+
+  let assert Ok(_) =
+    postgleam.simple_query(conn, "CREATE TEMP TABLE _tx_dx_test (id int)")
+
+  let decoder = {
+    use n <- decode.element(0, decode.int)
+    decode.success(n)
+  }
+
+  let assert Ok(count) =
+    postgleam.transaction(conn, fn(c) {
+      let assert Ok(_) =
+        postgleam.query(c, "INSERT INTO _tx_dx_test VALUES ($1::int4)", [
+          postgleam.int(1),
+        ])
+      let assert Ok(_) =
+        postgleam.query(c, "INSERT INTO _tx_dx_test VALUES ($1::int4)", [
+          postgleam.int(2),
+        ])
+      postgleam.query_one(
+        c,
+        "SELECT count(*)::int4 FROM _tx_dx_test",
+        [],
+        decoder,
+      )
+    })
+
+  should.equal(count, 2)
+  postgleam.disconnect(conn)
+}
+
+// =============================================================================
+// Existing tests
+// =============================================================================
 
 pub fn float_special_values_test() {
   let cfg = test_config()

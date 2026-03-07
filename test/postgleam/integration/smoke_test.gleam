@@ -61,7 +61,7 @@ pub fn smoke_transaction_commit_test() {
 
   // Transaction that commits
   let assert Ok(42) =
-    postgleam.transaction(conn, fn() {
+    postgleam.transaction(conn, fn(conn) {
       let assert Ok(_) =
         postgleam.query(conn, "INSERT INTO _smoke_tx VALUES ($1::int4)", [
           Some(value.Integer(1)),
@@ -89,7 +89,7 @@ pub fn smoke_transaction_rollback_test() {
 
   // Transaction that rolls back
   let assert Error(_) =
-    postgleam.transaction(conn, fn() {
+    postgleam.transaction(conn, fn(conn) {
       let assert Ok(_) =
         postgleam.query(conn, "INSERT INTO _smoke_tx2 VALUES ($1::int4)", [
           Some(value.Integer(99)),

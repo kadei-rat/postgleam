@@ -4,32 +4,57 @@
 ///
 /// ```gleam
 /// let assert Ok(conn) = postgleam.connect(config.default() |> config.database("mydb"))
-/// let assert Ok(result) = postgleam.query(conn, "SELECT $1::int4", [Some(value.Integer(42))])
+/// let assert Ok(response) = postgleam.query_with(
+///   conn,
+///   "SELECT $1::int4, $2::text",
+///   [postgleam.int(42), postgleam.text("hello")],
+///   {
+///     use id <- decode.element(0, decode.int)
+///     use name <- decode.element(1, decode.text)
+///     decode.success(#(id, name))
+///   },
+/// )
 /// postgleam.disconnect(conn)
 /// ```
 
 import gleam/erlang/process.{type Subject}
-import gleam/option.{type Option}
+import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import postgleam/config.{type Config}
 import postgleam/connection.{
   type ExtendedQueryResult, type PreparedStatement, type SimpleQueryResult,
 }
+import postgleam/decode.{type RowDecoder}
 import postgleam/error.{type Error}
 import postgleam/internal/connection_actor.{type Message}
 import postgleam/value.{type Value}
 
-/// An opaque connection handle backed by an OTP actor
+/// A query parameter value (nullable).
+pub type Param =
+  Option(Value)
+
+/// Result from a decoded query.
+pub type Response(a) {
+  Response(rows: List(a), count: Int, tag: String)
+}
+
+/// An opaque connection handle backed by an OTP actor.
 pub opaque type Connection {
   Connection(subject: Subject(Message), config: Config)
 }
 
 /// Connect to PostgreSQL and return a connection handle.
 /// The connection is managed by an OTP actor process.
-pub fn connect(config: Config) -> Result(Connection, String) {
+pub fn connect(config: Config) -> Result(Connection, Error) {
   case connection_actor.start(config) {
     Ok(started) -> Ok(Connection(subject: started.data, config: config))
-    Error(err) -> Error(start_error_to_string(err))
+    Error(actor.InitTimeout) ->
+      Error(error.ConnectionError("Connection initialization timed out"))
+    Error(actor.InitFailed(reason)) ->
+      Error(error.ConnectionError(reason))
+    Error(actor.InitExited(_)) ->
+      Error(error.ConnectionError("Connection process exited during init"))
   }
 }
 
@@ -40,11 +65,50 @@ pub fn connect(config: Config) -> Result(Connection, String) {
 pub fn query(
   conn: Connection,
   sql: String,
-  params: List(Option(Value)),
+  params: List(Param),
 ) -> Result(ExtendedQueryResult, Error) {
   process.call(conn.subject, conn.config.timeout, fn(reply) {
     connection_actor.Query(sql, params, reply)
   })
+}
+
+/// Execute a parameterized query and decode each row using the provided decoder.
+pub fn query_with(
+  conn: Connection,
+  sql: String,
+  params: List(Param),
+  decoder: RowDecoder(a),
+) -> Result(Response(a), Error) {
+  case query(conn, sql, params) {
+    Ok(result) ->
+      case decode_rows(result.rows, decoder, []) {
+        Ok(decoded) ->
+          Ok(Response(
+            rows: decoded,
+            count: list.length(decoded),
+            tag: result.tag,
+          ))
+        Error(e) -> Error(e)
+      }
+    Error(e) -> Error(e)
+  }
+}
+
+/// Execute a query and return the first decoded row, or error if no rows.
+pub fn query_one(
+  conn: Connection,
+  sql: String,
+  params: List(Param),
+  decoder: RowDecoder(a),
+) -> Result(a, Error) {
+  case query_with(conn, sql, params, decoder) {
+    Ok(response) ->
+      case response.rows {
+        [first, ..] -> Ok(first)
+        [] -> Error(error.DecodeError("Expected at least one row, got none"))
+      }
+    Error(e) -> Error(e)
+  }
 }
 
 /// Execute a simple text query (no parameters).
@@ -73,7 +137,7 @@ pub fn prepare(
 pub fn execute(
   conn: Connection,
   prepared: PreparedStatement,
-  params: List(Option(Value)),
+  params: List(Param),
 ) -> Result(ExtendedQueryResult, Error) {
   process.call(conn.subject, conn.config.timeout, fn(reply) {
     connection_actor.ExecutePrepared(prepared, params, reply)
@@ -98,12 +162,12 @@ pub fn disconnect(conn: Connection) -> Nil {
 /// Automatically BEGINs, and COMMITs on Ok or ROLLBACKs on Error.
 pub fn transaction(
   conn: Connection,
-  f: fn() -> Result(a, Error),
+  f: fn(Connection) -> Result(a, Error),
 ) -> Result(a, Error) {
   case simple_query(conn, "BEGIN") {
     Error(e) -> Error(e)
     Ok(_) -> {
-      case f() {
+      case f(conn) {
         Ok(val) -> {
           case simple_query(conn, "COMMIT") {
             Ok(_) -> Ok(val)
@@ -124,12 +188,106 @@ pub fn query_error(message: String) -> Error {
   error.ConnectionError(message)
 }
 
-// --- Helpers ---
+// =============================================================================
+// Parameter constructors
+// =============================================================================
 
-fn start_error_to_string(err: actor.StartError) -> String {
-  case err {
-    actor.InitTimeout -> "Connection initialization timed out"
-    actor.InitFailed(reason) -> reason
-    actor.InitExited(_) -> "Connection process exited during init"
+/// Create an integer parameter (int2, int4, int8).
+pub fn int(val: Int) -> Param {
+  Some(value.Integer(val))
+}
+
+/// Create a float parameter (float4, float8).
+pub fn float(val: Float) -> Param {
+  Some(value.Float(val))
+}
+
+/// Create a text/string parameter.
+pub fn text(val: String) -> Param {
+  Some(value.Text(val))
+}
+
+/// Create a boolean parameter.
+pub fn bool(val: Bool) -> Param {
+  Some(value.Boolean(val))
+}
+
+/// Create a NULL parameter.
+pub fn null() -> Param {
+  None
+}
+
+/// Create a bytea (binary data) parameter.
+pub fn bytea(val: BitArray) -> Param {
+  Some(value.Bytea(val))
+}
+
+/// Create a UUID parameter (16-byte binary).
+pub fn uuid(val: BitArray) -> Param {
+  Some(value.Uuid(val))
+}
+
+/// Create a JSON parameter.
+pub fn json(val: String) -> Param {
+  Some(value.Json(val))
+}
+
+/// Create a JSONB parameter.
+pub fn jsonb(val: String) -> Param {
+  Some(value.Jsonb(val))
+}
+
+/// Create a numeric/decimal parameter (string representation).
+pub fn numeric(val: String) -> Param {
+  Some(value.Numeric(val))
+}
+
+/// Create a date parameter (days since 2000-01-01).
+pub fn date(val: Int) -> Param {
+  Some(value.Date(val))
+}
+
+/// Create a timestamp parameter (microseconds since 2000-01-01 00:00:00).
+pub fn timestamp(val: Int) -> Param {
+  Some(value.Timestamp(val))
+}
+
+/// Create a timestamptz parameter (microseconds since 2000-01-01 00:00:00 UTC).
+pub fn timestamptz(val: Int) -> Param {
+  Some(value.Timestamptz(val))
+}
+
+/// Create a nullable parameter from an Option value.
+///
+/// ```gleam
+/// postgleam.nullable(Some("hello"), postgleam.text)
+/// // => Some(value.Text("hello"))
+///
+/// postgleam.nullable(None, postgleam.text)
+/// // => None
+/// ```
+pub fn nullable(val: Option(a), to_param: fn(a) -> Param) -> Param {
+  case val {
+    Some(v) -> to_param(v)
+    None -> None
+  }
+}
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+fn decode_rows(
+  rows: List(List(Option(Value))),
+  decoder: RowDecoder(a),
+  acc: List(a),
+) -> Result(List(a), Error) {
+  case rows {
+    [] -> Ok(list.reverse(acc))
+    [row, ..rest] ->
+      case decode.run(decoder, row) {
+        Ok(val) -> decode_rows(rest, decoder, [val, ..acc])
+        Error(e) -> Error(e)
+      }
   }
 }
