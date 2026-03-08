@@ -356,6 +356,51 @@ pub fn macaddr8(val: BitArray) -> Param {
   Some(value.Macaddr8(val))
 }
 
+/// Create an array parameter from a list of optional values.
+///
+/// ```gleam
+/// postgleam.array([Some(value.Integer(1)), Some(value.Integer(2)), None])
+/// ```
+pub fn array(val: List(Option(Value))) -> Param {
+  Some(value.Array(val))
+}
+
+/// Create a line parameter (Ax + By + C = 0).
+pub fn line(a: Float, b: Float, c: Float) -> Param {
+  Some(value.Line(a, b, c))
+}
+
+/// Create a line segment parameter (two endpoints).
+pub fn lseg(x1: Float, y1: Float, x2: Float, y2: Float) -> Param {
+  Some(value.Lseg(x1, y1, x2, y2))
+}
+
+/// Create a box parameter (upper-right and lower-left corners).
+pub fn box(x1: Float, y1: Float, x2: Float, y2: Float) -> Param {
+  Some(value.Box(x1, y1, x2, y2))
+}
+
+/// Create a path parameter (closed/open flag + list of points).
+pub fn path(closed: Bool, points: List(#(Float, Float))) -> Param {
+  Some(value.Path(closed, points))
+}
+
+/// Create a polygon parameter (list of vertices).
+pub fn polygon(vertices: List(#(Float, Float))) -> Param {
+  Some(value.Polygon(vertices))
+}
+
+/// Create an inet/cidr parameter (family, address bytes, netmask).
+/// Family: 2 for IPv4, 3 for IPv6.
+pub fn inet(family: Int, address: BitArray, netmask: Int) -> Param {
+  Some(value.Inet(family, address, netmask))
+}
+
+/// Create a bit string parameter (bit count + data bytes).
+pub fn bit_string(bit_count: Int, data: BitArray) -> Param {
+  Some(value.BitString(bit_count, data))
+}
+
 /// Create a nullable parameter from an Option value.
 ///
 /// ```gleam
