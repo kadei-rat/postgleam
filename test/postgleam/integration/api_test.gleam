@@ -1,3 +1,4 @@
+import gleam/erlang/process
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
@@ -6,6 +7,7 @@ import postgleam
 import postgleam/config
 import postgleam/decode
 import postgleam/error
+import postgleam/pool as postgleam_pool
 import postgleam/value
 
 fn test_config() {
@@ -666,4 +668,173 @@ pub fn float_special_values_test() {
     [Some(value.NaN), Some(value.PosInfinity), Some(value.NegInfinity)],
   ])
   postgleam.disconnect(conn)
+}
+
+// =============================================================================
+// PgBouncer mode tests
+// =============================================================================
+
+fn pgbouncer_config() {
+  config.default()
+  |> config.database("postgleam_test")
+  |> config.pgbouncer(True)
+}
+
+pub fn pgbouncer_query_test() {
+  let cfg = pgbouncer_config()
+  let assert Ok(conn) = postgleam.connect(cfg)
+
+  let assert Ok(result) =
+    postgleam.query(conn, "SELECT $1::int4 AS num", [postgleam.int(42)])
+
+  should.equal(result.tag, "SELECT 1")
+  should.equal(result.rows, [[Some(value.Integer(42))]])
+  postgleam.disconnect(conn)
+}
+
+pub fn pgbouncer_query_with_test() {
+  let cfg = pgbouncer_config()
+  let assert Ok(conn) = postgleam.connect(cfg)
+
+  let decoder = {
+    use id <- decode.element(0, decode.int)
+    use name <- decode.element(1, decode.text)
+    decode.success(#(id, name))
+  }
+
+  let assert Ok(response) =
+    postgleam.query_with(
+      conn,
+      "SELECT $1::int4, $2::text",
+      [postgleam.int(1), postgleam.text("hello")],
+      decoder,
+    )
+
+  should.equal(response.rows, [#(1, "hello")])
+  should.equal(response.count, 1)
+  postgleam.disconnect(conn)
+}
+
+pub fn pgbouncer_batch_test() {
+  let cfg = pgbouncer_config()
+  let assert Ok(conn) = postgleam.connect(cfg)
+
+  let assert Ok(_) =
+    postgleam.simple_query(
+      conn,
+      "CREATE TEMP TABLE pgb_batch_test (id int4 PRIMARY KEY, val text)",
+    )
+
+  let param_sets =
+    list.map([1, 2, 3, 4, 5], fn(i) {
+      [postgleam.int(i), postgleam.text("row_" <> string.inspect(i))]
+    })
+
+  let assert Ok(results) =
+    postgleam.query_batch(
+      conn,
+      "INSERT INTO pgb_batch_test (id, val) VALUES ($1, $2)",
+      param_sets,
+    )
+
+  should.equal(list.length(results), 5)
+
+  let assert Ok(count_result) =
+    postgleam.query(conn, "SELECT count(*)::int4 FROM pgb_batch_test", [])
+  should.equal(count_result.rows, [[Some(value.Integer(5))]])
+
+  postgleam.disconnect(conn)
+}
+
+pub fn pgbouncer_transaction_test() {
+  let cfg = pgbouncer_config()
+  let assert Ok(conn) = postgleam.connect(cfg)
+
+  let assert Ok(_) =
+    postgleam.simple_query(
+      conn,
+      "CREATE TEMP TABLE pgb_tx_test (id int4 PRIMARY KEY)",
+    )
+
+  let assert Ok(result) =
+    postgleam.transaction(conn, fn(c) {
+      let assert Ok(_) =
+        postgleam.query(c, "INSERT INTO pgb_tx_test VALUES ($1)", [
+          postgleam.int(1),
+        ])
+      let assert Ok(_) =
+        postgleam.query(c, "INSERT INTO pgb_tx_test VALUES ($1)", [
+          postgleam.int(2),
+        ])
+      postgleam.query(c, "SELECT count(*)::int4 FROM pgb_tx_test", [])
+    })
+
+  should.equal(result.rows, [[Some(value.Integer(2))]])
+  postgleam.disconnect(conn)
+}
+
+pub fn pgbouncer_repeated_query_test() {
+  let cfg = pgbouncer_config()
+  let assert Ok(conn) = postgleam.connect(cfg)
+
+  // Same SQL executed multiple times — verifies no stale cache issues
+  let assert Ok(r1) =
+    postgleam.query(conn, "SELECT $1::int4", [postgleam.int(1)])
+  let assert Ok(r2) =
+    postgleam.query(conn, "SELECT $1::int4", [postgleam.int(2)])
+  let assert Ok(r3) =
+    postgleam.query(conn, "SELECT $1::int4", [postgleam.int(3)])
+
+  should.equal(r1.rows, [[Some(value.Integer(1))]])
+  should.equal(r2.rows, [[Some(value.Integer(2))]])
+  should.equal(r3.rows, [[Some(value.Integer(3))]])
+  postgleam.disconnect(conn)
+}
+
+// =============================================================================
+// Pool hardening tests
+// =============================================================================
+
+pub fn pool_health_check_test() {
+  let cfg =
+    test_config()
+    |> config.idle_interval(500)
+
+  let assert Ok(started) = postgleam_pool.start(cfg, 2)
+  let pool = started.data
+
+  // Query should work
+  let assert Ok(result) =
+    postgleam_pool.query(pool, "SELECT 1::int4", [], 5000)
+  should.equal(result.rows, [[Some(value.Integer(1))]])
+
+  // Wait for health check to run
+  process.sleep(700)
+
+  // Query should still work after health check
+  let assert Ok(result2) =
+    postgleam_pool.query(pool, "SELECT 2::int4", [], 5000)
+  should.equal(result2.rows, [[Some(value.Integer(2))]])
+
+  postgleam_pool.shutdown(pool, 5000)
+}
+
+pub fn pool_pgbouncer_mode_test() {
+  let cfg =
+    pgbouncer_config()
+    |> config.idle_interval(5000)
+
+  let assert Ok(started) = postgleam_pool.start(cfg, 2)
+  let pool = started.data
+
+  let assert Ok(result) =
+    postgleam_pool.query(
+      pool,
+      "SELECT $1::int4",
+      [Some(value.Integer(42))],
+      5000,
+    )
+  should.equal(result.rows, [[Some(value.Integer(42))]])
+
+  postgleam_pool.shutdown(pool, 5000)
 }

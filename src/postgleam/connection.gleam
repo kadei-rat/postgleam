@@ -468,6 +468,149 @@ pub fn close_statement(
   recv_ready_for_query(state, "", timeout)
 }
 
+/// PgBouncer-safe extended query using unnamed statements with Flush.
+/// Uses Flush (not Sync) for the Parse+Describe phase so PgBouncer
+/// doesn't see a ReadyForQuery and release the backend mid-query.
+pub fn extended_query_unnamed(
+  state: ConnectionState,
+  sql: String,
+  params: List(Option(Value)),
+  registry: Registry,
+  timeout: Int,
+) -> Result(#(ExtendedQueryResult, ConnectionState), Error) {
+  // Phase 1: Parse + Describe + Flush (no ReadyForQuery generated)
+  use state <- result.try(send_message(
+    state,
+    message.Parse("", sql, []),
+  ))
+  use state <- result.try(send_message(
+    state,
+    message.Describe(message.DescribeStatement, ""),
+  ))
+  use state <- result.try(send_message(state, message.Flush))
+
+  use state <- result.try(recv_parse_complete(state, sql, timeout))
+  use #(param_oids, state) <- result.try(
+    recv_parameter_description(state, sql, timeout),
+  )
+  use #(result_fields, state) <- result.try(
+    recv_row_description_or_nodata(state, sql, timeout),
+  )
+  // No recv_ready_for_query here — Flush doesn't trigger it
+
+  // Phase 2: Bind + Execute + Sync (single ReadyForQuery at end)
+  use encoded_params <- result.try(
+    encode_params_binary(params, param_oids, registry),
+  )
+
+  let param_formats = list.map(param_oids, fn(_) { message.BinaryFormat })
+  let result_formats =
+    list.map(result_fields, fn(_) { message.BinaryFormat })
+
+  let prepared =
+    PreparedStatement(
+      name: "",
+      statement: sql,
+      param_oids: param_oids,
+      result_fields: result_fields,
+    )
+
+  use state <- result.try(send_message(
+    state,
+    message.Bind("", "", param_formats, encoded_params, result_formats),
+  ))
+  use state <- result.try(send_message(state, message.Execute("", 0)))
+  use state <- result.try(send_message(state, message.Sync))
+
+  use state <- result.try(
+    recv_bind_complete(state, sql, timeout),
+  )
+  let decoders = resolve_row_decoders(prepared.result_fields, registry)
+  use #(tag, rows, state) <- result.try(
+    recv_execute_rows(state, prepared, decoders, timeout, []),
+  )
+  use state <- result.try(recv_ready_for_query(state, sql, timeout))
+
+  Ok(#(
+    ExtendedQueryResult(
+      tag: tag,
+      columns: result_fields,
+      rows: list_reverse(rows),
+    ),
+    state,
+  ))
+}
+
+/// PgBouncer-safe batch query using unnamed statements with Flush.
+/// Parse+Describe via Flush, then N Bind+Execute pairs, then single Sync.
+pub fn extended_query_pipeline_unnamed(
+  state: ConnectionState,
+  sql: String,
+  param_sets: List(List(Option(Value))),
+  registry: Registry,
+  timeout: Int,
+) -> Result(#(List(ExtendedQueryResult), ConnectionState), Error) {
+  // Phase 1: Parse + Describe + Flush (no ReadyForQuery)
+  use state <- result.try(send_message(
+    state,
+    message.Parse("", sql, []),
+  ))
+  use state <- result.try(send_message(
+    state,
+    message.Describe(message.DescribeStatement, ""),
+  ))
+  use state <- result.try(send_message(state, message.Flush))
+
+  use state <- result.try(recv_parse_complete(state, sql, timeout))
+  use #(param_oids, state) <- result.try(
+    recv_parameter_description(state, sql, timeout),
+  )
+  use #(result_fields, state) <- result.try(
+    recv_row_description_or_nodata(state, sql, timeout),
+  )
+  // No recv_ready_for_query — Flush doesn't trigger it
+
+  let prepared =
+    PreparedStatement(
+      name: "",
+      statement: sql,
+      param_oids: param_oids,
+      result_fields: result_fields,
+    )
+
+  let param_formats =
+    list.map(prepared.param_oids, fn(_) { message.BinaryFormat })
+  let result_formats =
+    list.map(prepared.result_fields, fn(_) { message.BinaryFormat })
+
+  // Phase 2: N × (Bind + Execute) + Sync
+  use state <- result.try(send_pipeline_messages(
+    state,
+    prepared,
+    param_sets,
+    param_formats,
+    result_formats,
+    registry,
+  ))
+  use state <- result.try(send_message(state, message.Sync))
+
+  // Read all results
+  let decoders = resolve_row_decoders(prepared.result_fields, registry)
+  let count = list.length(param_sets)
+  use #(results, state) <- result.try(recv_pipeline_results(
+    state,
+    prepared,
+    decoders,
+    timeout,
+    count,
+    [],
+  ))
+  use state <- result.try(
+    recv_ready_for_query(state, prepared.statement, timeout),
+  )
+  Ok(#(results, state))
+}
+
 /// All-in-one extended query: Parse + Describe + Bind + Execute + Close + Sync
 /// Uses unnamed statement and portal for simplicity.
 pub fn extended_query(

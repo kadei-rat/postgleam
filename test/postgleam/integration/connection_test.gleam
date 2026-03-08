@@ -99,6 +99,9 @@ pub fn connect_scram_auth_test() {
       connect_timeout: 5000,
       extra_parameters: [],
       ssl: config.SslDisabled,
+      pgbouncer: False,
+      idle_interval: 1000,
+      queue_timeout: 5000,
     )
   let assert Ok(state) = connection.connect(cfg)
   should.be_true(is_some(state.connection_id))

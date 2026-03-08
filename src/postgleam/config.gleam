@@ -10,6 +10,9 @@ pub type Config {
     connect_timeout: Int,
     extra_parameters: List(#(String, String)),
     ssl: SslMode,
+    pgbouncer: Bool,
+    idle_interval: Int,
+    queue_timeout: Int,
   )
 }
 
@@ -35,6 +38,9 @@ pub fn default() -> Config {
     connect_timeout: 5000,
     extra_parameters: [],
     ssl: SslDisabled,
+    pgbouncer: False,
+    idle_interval: 1000,
+    queue_timeout: 5000,
   )
 }
 
@@ -64,4 +70,37 @@ pub fn timeout(config: Config, timeout: Int) -> Config {
 
 pub fn ssl(config: Config, mode: SslMode) -> Config {
   Config(..config, ssl: mode)
+}
+
+/// Set connect timeout in milliseconds.
+pub fn connect_timeout(config: Config, ms: Int) -> Config {
+  Config(..config, connect_timeout: ms)
+}
+
+/// Set extra startup parameters sent to PostgreSQL.
+pub fn extra_parameters(
+  config: Config,
+  params: List(#(String, String)),
+) -> Config {
+  Config(..config, extra_parameters: params)
+}
+
+/// Enable PgBouncer compatibility mode.
+/// Uses unnamed prepared statements with Flush to avoid mid-query
+/// backend reassignment in PgBouncer transaction pooling mode.
+pub fn pgbouncer(config: Config, enabled: Bool) -> Config {
+  Config(..config, pgbouncer: enabled)
+}
+
+/// Set the health check interval in milliseconds (pool only).
+/// Idle connections are pinged at this interval. Default: 1000ms.
+pub fn idle_interval(config: Config, ms: Int) -> Config {
+  Config(..config, idle_interval: ms)
+}
+
+/// Set the maximum time in milliseconds to wait for a pool connection.
+/// If no connection becomes available within this time, returns TimeoutError.
+/// Default: 5000ms.
+pub fn queue_timeout(config: Config, ms: Int) -> Config {
+  Config(..config, queue_timeout: ms)
 }

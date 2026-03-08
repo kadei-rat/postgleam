@@ -2,7 +2,8 @@
 -export([crypto_exor/2, crypto_strong_rand_bytes/1, crypto_mac_hmac/2, md5_hash/1, sha256_hash/1,
          encode_float32/1, decode_float32/1, encode_numeric/1,
          int_shr/2, int_shl/2, int_band/2, int_bor/2, int_to_hex/1, hex_to_int/1,
-         ssl_upgrade/4, ssl_send/2, ssl_recv/2, ssl_close/1]).
+         ssl_upgrade/4, ssl_send/2, ssl_recv/2, ssl_close/1,
+         monotonic_time_ms/0]).
 
 crypto_exor(A, B) ->
     crypto:exor(A, B).
@@ -150,4 +151,8 @@ ssl_recv(SslSock, Timeout) ->
 ssl_close(SslSock) ->
     ssl:close(SslSock),
     nil.
+
+%% Monotonic time in milliseconds (for pool queue timeout tracking)
+monotonic_time_ms() ->
+    erlang:monotonic_time(millisecond).
 

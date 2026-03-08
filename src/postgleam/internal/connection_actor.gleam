@@ -4,6 +4,7 @@
 import gleam/dict.{type Dict}
 import gleam/erlang/process.{type Subject}
 import gleam/int
+import gleam/list
 import gleam/option.{type Option}
 import gleam/otp/actor
 import postgleam/codec/defaults
@@ -69,6 +70,9 @@ pub type Message {
   Disconnect(reply: Subject(Nil))
 }
 
+/// Maximum number of cached prepared statements before eviction.
+const max_cache_size = 256
+
 /// Actor state
 pub type ActorState {
   ActorState(
@@ -76,6 +80,7 @@ pub type ActorState {
     config: Config,
     registry: Registry,
     cache: Dict(String, PreparedStatement),
+    cache_order: List(String),
     next_id: Int,
   )
 }
@@ -94,6 +99,7 @@ pub fn start(
             config: config,
             registry: reg,
             cache: dict.new(),
+            cache_order: [],
             next_id: 0,
           )
         actor.initialised(state)
@@ -113,13 +119,13 @@ fn handle_message(
 ) -> actor.Next(ActorState, Message) {
   case msg {
     Query(sql, params, reply) -> {
-      case dict.get(state.cache, sql) {
-        // Cache hit: skip Parse+Describe, just Bind+Execute
-        Ok(cached) -> {
+      case state.config.pgbouncer {
+        // PgBouncer mode: always use unnamed statements, no caching
+        True -> {
           case
-            connection.execute_prepared(
+            connection.extended_query_unnamed(
               state.conn,
-              cached,
+              sql,
               params,
               state.registry,
               state.config.timeout,
@@ -135,56 +141,87 @@ fn handle_message(
             }
           }
         }
-        // Cache miss: Prepare, cache, then Execute
-        Error(_) -> {
-          let stmt_name = "_pg_" <> int.to_string(state.next_id)
-          case
-            connection.prepare(
-              state.conn,
-              stmt_name,
-              sql,
-              [],
-              state.config.timeout,
-            )
-          {
-            Ok(#(prepared, conn)) -> {
-              let new_cache = dict.insert(state.cache, sql, prepared)
+        // Normal mode: named statements + caching
+        False -> {
+          case dict.get(state.cache, sql) {
+            // Cache hit: skip Parse+Describe, just Bind+Execute
+            Ok(cached) -> {
               case
                 connection.execute_prepared(
-                  conn,
-                  prepared,
+                  state.conn,
+                  cached,
                   params,
                   state.registry,
                   state.config.timeout,
                 )
               {
-                Ok(#(result, conn2)) -> {
+                Ok(#(result, conn)) -> {
                   process.send(reply, Ok(result))
-                  actor.continue(
-                    ActorState(
-                      ..state,
-                      conn: conn2,
-                      cache: new_cache,
-                      next_id: state.next_id + 1,
-                    ),
-                  )
+                  actor.continue(ActorState(..state, conn: conn))
                 }
                 Error(e) -> {
                   process.send(reply, Error(e))
-                  actor.continue(
-                    ActorState(
-                      ..state,
-                      conn: conn,
-                      cache: new_cache,
-                      next_id: state.next_id + 1,
-                    ),
-                  )
+                  actor.continue(state)
                 }
               }
             }
-            Error(e) -> {
-              process.send(reply, Error(e))
-              actor.continue(state)
+            // Cache miss: Prepare, cache, then Execute
+            Error(_) -> {
+              let state = evict_if_needed(state)
+              let stmt_name = "_pg_" <> int.to_string(state.next_id)
+              case
+                connection.prepare(
+                  state.conn,
+                  stmt_name,
+                  sql,
+                  [],
+                  state.config.timeout,
+                )
+              {
+                Ok(#(prepared, conn)) -> {
+                  let new_cache = dict.insert(state.cache, sql, prepared)
+                  let new_order =
+                    list.append(state.cache_order, [sql])
+                  case
+                    connection.execute_prepared(
+                      conn,
+                      prepared,
+                      params,
+                      state.registry,
+                      state.config.timeout,
+                    )
+                  {
+                    Ok(#(result, conn2)) -> {
+                      process.send(reply, Ok(result))
+                      actor.continue(
+                        ActorState(
+                          ..state,
+                          conn: conn2,
+                          cache: new_cache,
+                          cache_order: new_order,
+                          next_id: state.next_id + 1,
+                        ),
+                      )
+                    }
+                    Error(e) -> {
+                      process.send(reply, Error(e))
+                      actor.continue(
+                        ActorState(
+                          ..state,
+                          conn: conn,
+                          cache: new_cache,
+                          cache_order: new_order,
+                          next_id: state.next_id + 1,
+                        ),
+                      )
+                    }
+                  }
+                }
+                Error(e) -> {
+                  process.send(reply, Error(e))
+                  actor.continue(state)
+                }
+              }
             }
           }
         }
@@ -241,13 +278,13 @@ fn handle_message(
     }
 
     BatchQuery(sql, param_sets, reply) -> {
-      // Ensure the statement is cached
-      case dict.get(state.cache, sql) {
-        Ok(cached) -> {
+      case state.config.pgbouncer {
+        // PgBouncer mode: unnamed pipeline
+        True -> {
           case
-            connection.execute_pipeline(
+            connection.extended_query_pipeline_unnamed(
               state.conn,
-              cached,
+              sql,
               param_sets,
               state.registry,
               state.config.timeout,
@@ -263,55 +300,85 @@ fn handle_message(
             }
           }
         }
-        Error(_) -> {
-          let stmt_name = "_pg_" <> int.to_string(state.next_id)
-          case
-            connection.prepare(
-              state.conn,
-              stmt_name,
-              sql,
-              [],
-              state.config.timeout,
-            )
-          {
-            Ok(#(prepared, conn)) -> {
-              let new_cache = dict.insert(state.cache, sql, prepared)
+        // Normal mode: named statement + pipeline
+        False -> {
+          case dict.get(state.cache, sql) {
+            Ok(cached) -> {
               case
                 connection.execute_pipeline(
-                  conn,
-                  prepared,
+                  state.conn,
+                  cached,
                   param_sets,
                   state.registry,
                   state.config.timeout,
                 )
               {
-                Ok(#(results, conn2)) -> {
+                Ok(#(results, conn)) -> {
                   process.send(reply, Ok(results))
-                  actor.continue(
-                    ActorState(
-                      ..state,
-                      conn: conn2,
-                      cache: new_cache,
-                      next_id: state.next_id + 1,
-                    ),
-                  )
+                  actor.continue(ActorState(..state, conn: conn))
                 }
                 Error(e) -> {
                   process.send(reply, Error(e))
-                  actor.continue(
-                    ActorState(
-                      ..state,
-                      conn: conn,
-                      cache: new_cache,
-                      next_id: state.next_id + 1,
-                    ),
-                  )
+                  actor.continue(state)
                 }
               }
             }
-            Error(e) -> {
-              process.send(reply, Error(e))
-              actor.continue(state)
+            Error(_) -> {
+              let state = evict_if_needed(state)
+              let stmt_name = "_pg_" <> int.to_string(state.next_id)
+              case
+                connection.prepare(
+                  state.conn,
+                  stmt_name,
+                  sql,
+                  [],
+                  state.config.timeout,
+                )
+              {
+                Ok(#(prepared, conn)) -> {
+                  let new_cache = dict.insert(state.cache, sql, prepared)
+                  let new_order =
+                    list.append(state.cache_order, [sql])
+                  case
+                    connection.execute_pipeline(
+                      conn,
+                      prepared,
+                      param_sets,
+                      state.registry,
+                      state.config.timeout,
+                    )
+                  {
+                    Ok(#(results, conn2)) -> {
+                      process.send(reply, Ok(results))
+                      actor.continue(
+                        ActorState(
+                          ..state,
+                          conn: conn2,
+                          cache: new_cache,
+                          cache_order: new_order,
+                          next_id: state.next_id + 1,
+                        ),
+                      )
+                    }
+                    Error(e) -> {
+                      process.send(reply, Error(e))
+                      actor.continue(
+                        ActorState(
+                          ..state,
+                          conn: conn,
+                          cache: new_cache,
+                          cache_order: new_order,
+                          next_id: state.next_id + 1,
+                        ),
+                      )
+                    }
+                  }
+                }
+                Error(e) -> {
+                  process.send(reply, Error(e))
+                  actor.continue(state)
+                }
+              }
             }
           }
         }
@@ -364,6 +431,38 @@ fn handle_message(
       process.send(reply, Nil)
       actor.stop()
     }
+  }
+}
+
+/// Evict the oldest cached statement if cache is at capacity.
+fn evict_if_needed(state: ActorState) -> ActorState {
+  case list.length(state.cache_order) >= max_cache_size {
+    True -> {
+      case state.cache_order {
+        [oldest, ..rest] -> {
+          // Close the statement on the server (best-effort)
+          case dict.get(state.cache, oldest) {
+            Ok(prepared) -> {
+              let _ =
+                connection.close_statement(
+                  state.conn,
+                  prepared.name,
+                  state.config.timeout,
+                )
+              Nil
+            }
+            Error(_) -> Nil
+          }
+          ActorState(
+            ..state,
+            cache: dict.delete(state.cache, oldest),
+            cache_order: rest,
+          )
+        }
+        [] -> state
+      }
+    }
+    False -> state
   }
 }
 
