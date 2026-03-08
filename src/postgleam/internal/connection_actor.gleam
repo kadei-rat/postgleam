@@ -65,7 +65,7 @@ pub fn start(
   actor.new_with_initialiser(config.connect_timeout + 1000, fn(subject) {
     case connection.connect(config) {
       Ok(conn) -> {
-        let reg = registry.build(defaults.matchers())
+        let reg = defaults.build_registry()
         let state = ActorState(conn: conn, config: config, registry: reg)
         actor.initialised(state)
         |> actor.returning(subject)

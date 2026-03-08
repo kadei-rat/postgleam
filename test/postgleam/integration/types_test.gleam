@@ -179,3 +179,192 @@ pub fn multiple_types_in_one_query_test() {
     result.rows
   postgleam.disconnect(conn)
 }
+
+// =============================================================================
+// New type integration tests
+// =============================================================================
+
+pub fn macaddr8_roundtrip_test() {
+  let assert Ok(conn) = postgleam.connect(test_config())
+  let assert Ok(result) =
+    postgleam.query(conn, "SELECT $1::macaddr8 AS val", [
+      Some(value.Macaddr8(<<0x08, 0x00, 0x2B, 0x01, 0x02, 0x03, 0x04, 0x05>>)),
+    ])
+  should.equal(result.rows, [
+    [Some(value.Macaddr8(<<0x08, 0x00, 0x2B, 0x01, 0x02, 0x03, 0x04, 0x05>>))],
+  ])
+  postgleam.disconnect(conn)
+}
+
+pub fn money_roundtrip_test() {
+  let assert Ok(conn) = postgleam.connect(test_config())
+  let assert Ok(result) =
+    postgleam.query(conn, "SELECT $1::money AS val", [
+      Some(value.Money(1234)),
+    ])
+  should.equal(result.rows, [[Some(value.Money(1234))]])
+  postgleam.disconnect(conn)
+}
+
+pub fn xml_roundtrip_test() {
+  let assert Ok(conn) = postgleam.connect(test_config())
+  let xml = "<root><item>hello</item></root>"
+  let assert Ok(result) =
+    postgleam.query(conn, "SELECT $1::xml AS val", [
+      Some(value.Xml(xml)),
+    ])
+  should.equal(result.rows, [[Some(value.Xml(xml))]])
+  postgleam.disconnect(conn)
+}
+
+pub fn bit_roundtrip_test() {
+  let assert Ok(conn) = postgleam.connect(test_config())
+  let assert Ok(result) =
+    postgleam.query(conn, "SELECT $1::bit(8) AS val", [
+      Some(value.BitString(8, <<0xFF>>)),
+    ])
+  should.equal(result.rows, [[Some(value.BitString(8, <<0xFF>>))]])
+  postgleam.disconnect(conn)
+}
+
+pub fn varbit_roundtrip_test() {
+  let assert Ok(conn) = postgleam.connect(test_config())
+  let assert Ok(result) =
+    postgleam.query(conn, "SELECT $1::varbit AS val", [
+      Some(value.BitString(5, <<0b10110_000>>)),
+    ])
+  should.equal(result.rows, [[Some(value.BitString(5, <<0b10110_000>>))]])
+  postgleam.disconnect(conn)
+}
+
+pub fn line_roundtrip_test() {
+  let assert Ok(conn) = postgleam.connect(test_config())
+  let assert Ok(result) =
+    postgleam.query(conn, "SELECT $1::line AS val", [
+      Some(value.Line(1.0, 2.0, 3.0)),
+    ])
+  should.equal(result.rows, [[Some(value.Line(1.0, 2.0, 3.0))]])
+  postgleam.disconnect(conn)
+}
+
+pub fn lseg_roundtrip_test() {
+  let assert Ok(conn) = postgleam.connect(test_config())
+  let assert Ok(result) =
+    postgleam.query(conn, "SELECT $1::lseg AS val", [
+      Some(value.Lseg(1.0, 2.0, 3.0, 4.0)),
+    ])
+  should.equal(result.rows, [[Some(value.Lseg(1.0, 2.0, 3.0, 4.0))]])
+  postgleam.disconnect(conn)
+}
+
+pub fn box_roundtrip_test() {
+  let assert Ok(conn) = postgleam.connect(test_config())
+  let assert Ok(result) =
+    postgleam.query(conn, "SELECT $1::box AS val", [
+      Some(value.Box(3.0, 4.0, 1.0, 2.0)),
+    ])
+  should.equal(result.rows, [[Some(value.Box(3.0, 4.0, 1.0, 2.0))]])
+  postgleam.disconnect(conn)
+}
+
+pub fn path_closed_roundtrip_test() {
+  let assert Ok(conn) = postgleam.connect(test_config())
+  let assert Ok(result) =
+    postgleam.query(conn, "SELECT $1::path AS val", [
+      Some(value.Path(True, [#(0.0, 0.0), #(1.0, 0.0), #(0.0, 1.0)])),
+    ])
+  should.equal(result.rows, [
+    [Some(value.Path(True, [#(0.0, 0.0), #(1.0, 0.0), #(0.0, 1.0)]))],
+  ])
+  postgleam.disconnect(conn)
+}
+
+pub fn path_open_roundtrip_test() {
+  let assert Ok(conn) = postgleam.connect(test_config())
+  let assert Ok(result) =
+    postgleam.query(conn, "SELECT $1::path AS val", [
+      Some(value.Path(False, [#(0.0, 0.0), #(5.0, 5.0)])),
+    ])
+  should.equal(result.rows, [
+    [Some(value.Path(False, [#(0.0, 0.0), #(5.0, 5.0)]))],
+  ])
+  postgleam.disconnect(conn)
+}
+
+pub fn polygon_roundtrip_test() {
+  let assert Ok(conn) = postgleam.connect(test_config())
+  let assert Ok(result) =
+    postgleam.query(conn, "SELECT $1::polygon AS val", [
+      Some(value.Polygon([#(0.0, 0.0), #(1.0, 0.0), #(0.0, 1.0)])),
+    ])
+  should.equal(result.rows, [
+    [Some(value.Polygon([#(0.0, 0.0), #(1.0, 0.0), #(0.0, 1.0)]))],
+  ])
+  postgleam.disconnect(conn)
+}
+
+pub fn circle_roundtrip_test() {
+  let assert Ok(conn) = postgleam.connect(test_config())
+  let assert Ok(result) =
+    postgleam.query(conn, "SELECT $1::circle AS val", [
+      Some(value.Circle(1.0, 2.0, 3.0)),
+    ])
+  should.equal(result.rows, [[Some(value.Circle(1.0, 2.0, 3.0))]])
+  postgleam.disconnect(conn)
+}
+
+pub fn int4_array_roundtrip_test() {
+  let assert Ok(conn) = postgleam.connect(test_config())
+  let assert Ok(result) =
+    postgleam.query(conn, "SELECT $1::int4[] AS val", [
+      Some(value.Array([Some(value.Integer(1)), Some(value.Integer(2)), Some(value.Integer(3))])),
+    ])
+  should.equal(result.rows, [
+    [Some(value.Array([Some(value.Integer(1)), Some(value.Integer(2)), Some(value.Integer(3))]))],
+  ])
+  postgleam.disconnect(conn)
+}
+
+pub fn text_array_roundtrip_test() {
+  let assert Ok(conn) = postgleam.connect(test_config())
+  let assert Ok(result) =
+    postgleam.query(conn, "SELECT $1::text[] AS val", [
+      Some(value.Array([Some(value.Text("hello")), Some(value.Text("world"))])),
+    ])
+  should.equal(result.rows, [
+    [Some(value.Array([Some(value.Text("hello")), Some(value.Text("world"))]))],
+  ])
+  postgleam.disconnect(conn)
+}
+
+pub fn bool_array_roundtrip_test() {
+  let assert Ok(conn) = postgleam.connect(test_config())
+  let assert Ok(result) =
+    postgleam.query(conn, "SELECT $1::bool[] AS val", [
+      Some(value.Array([Some(value.Boolean(True)), Some(value.Boolean(False))])),
+    ])
+  should.equal(result.rows, [
+    [Some(value.Array([Some(value.Boolean(True)), Some(value.Boolean(False))]))],
+  ])
+  postgleam.disconnect(conn)
+}
+
+pub fn array_with_null_roundtrip_test() {
+  let assert Ok(conn) = postgleam.connect(test_config())
+  let assert Ok(result) =
+    postgleam.query(conn, "SELECT $1::int4[] AS val", [
+      Some(value.Array([Some(value.Integer(1)), None, Some(value.Integer(3))])),
+    ])
+  should.equal(result.rows, [
+    [Some(value.Array([Some(value.Integer(1)), None, Some(value.Integer(3))]))],
+  ])
+  postgleam.disconnect(conn)
+}
+
+pub fn empty_array_roundtrip_test() {
+  let assert Ok(conn) = postgleam.connect(test_config())
+  let assert Ok(result) =
+    postgleam.query(conn, "SELECT '{}'::int4[] AS val", [])
+  should.equal(result.rows, [[Some(value.Array([]))]])
+  postgleam.disconnect(conn)
+}

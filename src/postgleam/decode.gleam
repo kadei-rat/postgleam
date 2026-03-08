@@ -267,5 +267,16 @@ fn value_type_name(val: Value) -> String {
     value.Point(_, _) -> "Point"
     value.Inet(_, _, _) -> "Inet"
     value.Macaddr(_) -> "Macaddr"
+    value.Macaddr8(_) -> "Macaddr8"
+    value.Money(_) -> "Money"
+    value.Xml(_) -> "Xml"
+    value.Jsonpath(_) -> "Jsonpath"
+    value.BitString(_, _) -> "BitString"
+    value.Line(_, _, _) -> "Line"
+    value.Lseg(_, _, _, _) -> "Lseg"
+    value.Box(_, _, _, _) -> "Box"
+    value.Path(_, _) -> "Path"
+    value.Polygon(_) -> "Polygon"
+    value.Circle(_, _, _) -> "Circle"
   }
 }

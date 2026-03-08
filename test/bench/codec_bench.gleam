@@ -2,16 +2,23 @@
 
 import bench/runner.{type BenchmarkResult}
 import gleam/list
+import gleam/option.{Some}
 import gleam/string
 import gleamy/bench
+import postgleam/codec
+import postgleam/codec/array
 import postgleam/codec/bool as bool_codec
+import postgleam/codec/circle as circle_codec
 import postgleam/codec/date as date_codec
 import postgleam/codec/float8 as float8_codec
+import postgleam/codec/inet as inet_codec
 import postgleam/codec/int4 as int4_codec
 import postgleam/codec/int8 as int8_codec
+import postgleam/codec/interval as interval_codec
 import postgleam/codec/json as json_codec
 import postgleam/codec/jsonb as jsonb_codec
 import postgleam/codec/numeric as numeric_codec
+import postgleam/codec/point as point_codec
 import postgleam/codec/text as text_codec
 import postgleam/codec/timestamp as timestamp_codec
 import postgleam/codec/uuid as uuid_codec
@@ -47,6 +54,18 @@ pub fn run() -> List(BenchmarkResult) {
     bench_date_decode(),
     bench_timestamp_encode(),
     bench_timestamp_decode(),
+    bench_point_encode(),
+    bench_point_decode(),
+    bench_circle_encode(),
+    bench_circle_decode(),
+    bench_inet_encode(),
+    bench_inet_decode(),
+    bench_interval_encode(),
+    bench_interval_decode(),
+    bench_array_int4_encode(),
+    bench_array_int4_decode(),
+    bench_array_text_encode(),
+    bench_array_text_decode(),
   ]
   list.flat_map(results, fn(r) { runner.extract_results(r) })
 }
@@ -250,6 +269,147 @@ fn bench_timestamp_decode() -> bench.BenchResults {
   bench.run(
     [bench.Input("8_bytes", encoded)],
     [bench.Function("timestamp.decode", fn(d) { timestamp_codec.decode(d) })],
+    [bench.Duration(duration), bench.Warmup(warmup)],
+  )
+}
+
+fn bench_point_encode() -> bench.BenchResults {
+  bench.run(
+    [bench.Input("point", value.Point(1.5, -2.5))],
+    [bench.Function("point.encode", fn(v) { point_codec.encode(v) })],
+    [bench.Duration(duration), bench.Warmup(warmup)],
+  )
+}
+
+fn bench_point_decode() -> bench.BenchResults {
+  bench.run(
+    [bench.Input("16_bytes", <<1.5:float-64-big, -2.5:float-64-big>>)],
+    [bench.Function("point.decode", fn(d) { point_codec.decode(d) })],
+    [bench.Duration(duration), bench.Warmup(warmup)],
+  )
+}
+
+fn bench_circle_encode() -> bench.BenchResults {
+  bench.run(
+    [bench.Input("circle", value.Circle(1.0, 2.0, 5.0))],
+    [bench.Function("circle.encode", fn(v) { circle_codec.encode(v) })],
+    [bench.Duration(duration), bench.Warmup(warmup)],
+  )
+}
+
+fn bench_circle_decode() -> bench.BenchResults {
+  bench.run(
+    [bench.Input("24_bytes", <<1.0:float-64-big, 2.0:float-64-big, 5.0:float-64-big>>)],
+    [bench.Function("circle.decode", fn(d) { circle_codec.decode(d) })],
+    [bench.Duration(duration), bench.Warmup(warmup)],
+  )
+}
+
+fn bench_inet_encode() -> bench.BenchResults {
+  bench.run(
+    [bench.Input("ipv4", value.Inet(2, <<192, 168, 1, 1>>, 32))],
+    [bench.Function("inet.encode", fn(v) { inet_codec.encode(v) })],
+    [bench.Duration(duration), bench.Warmup(warmup)],
+  )
+}
+
+fn bench_inet_decode() -> bench.BenchResults {
+  bench.run(
+    [bench.Input("8_bytes", <<2, 32, 0, 4, 192, 168, 1, 1>>)],
+    [bench.Function("inet.decode", fn(d) { inet_codec.decode(d) })],
+    [bench.Duration(duration), bench.Warmup(warmup)],
+  )
+}
+
+fn bench_interval_encode() -> bench.BenchResults {
+  // 1 year 2 months 3 days 4 hours
+  bench.run(
+    [bench.Input("interval", value.Interval(14_400_000_000, 3, 14))],
+    [bench.Function("interval.encode", fn(v) { interval_codec.encode(v) })],
+    [bench.Duration(duration), bench.Warmup(warmup)],
+  )
+}
+
+fn bench_interval_decode() -> bench.BenchResults {
+  let assert Ok(encoded) =
+    interval_codec.encode(value.Interval(14_400_000_000, 3, 14))
+  bench.run(
+    [bench.Input("16_bytes", encoded)],
+    [bench.Function("interval.decode", fn(d) { interval_codec.decode(d) })],
+    [bench.Duration(duration), bench.Warmup(warmup)],
+  )
+}
+
+fn build_int4_array_codec() -> codec.Codec {
+  let elem =
+    codec.Codec(
+      type_name: "int4",
+      oid: 23,
+      format: codec.Binary,
+      encode: int4_codec.encode,
+      decode: int4_codec.decode,
+    )
+  array.build_array_codec(elem, 1007)
+}
+
+fn build_text_array_codec() -> codec.Codec {
+  let elem =
+    codec.Codec(
+      type_name: "text",
+      oid: 25,
+      format: codec.Binary,
+      encode: text_codec.encode,
+      decode: text_codec.decode,
+    )
+  array.build_array_codec(elem, 1009)
+}
+
+fn bench_array_int4_encode() -> bench.BenchResults {
+  let c = build_int4_array_codec()
+  let elements =
+    list.range(1, 100)
+    |> list.map(fn(n) { Some(value.Integer(n)) })
+  bench.run(
+    [bench.Input("100_elements", value.Array(elements))],
+    [bench.Function("array_int4.encode", fn(v) { c.encode(v) })],
+    [bench.Duration(duration), bench.Warmup(warmup)],
+  )
+}
+
+fn bench_array_int4_decode() -> bench.BenchResults {
+  let c = build_int4_array_codec()
+  let elements =
+    list.range(1, 100)
+    |> list.map(fn(n) { Some(value.Integer(n)) })
+  let assert Ok(encoded) = c.encode(value.Array(elements))
+  bench.run(
+    [bench.Input("100_elements", encoded)],
+    [bench.Function("array_int4.decode", fn(d) { c.decode(d) })],
+    [bench.Duration(duration), bench.Warmup(warmup)],
+  )
+}
+
+fn bench_array_text_encode() -> bench.BenchResults {
+  let c = build_text_array_codec()
+  let elements =
+    list.range(1, 10)
+    |> list.map(fn(_) { Some(value.Text("hello world")) })
+  bench.run(
+    [bench.Input("10_elements", value.Array(elements))],
+    [bench.Function("array_text.encode", fn(v) { c.encode(v) })],
+    [bench.Duration(duration), bench.Warmup(warmup)],
+  )
+}
+
+fn bench_array_text_decode() -> bench.BenchResults {
+  let c = build_text_array_codec()
+  let elements =
+    list.range(1, 10)
+    |> list.map(fn(_) { Some(value.Text("hello world")) })
+  let assert Ok(encoded) = c.encode(value.Array(elements))
+  bench.run(
+    [bench.Input("10_elements", encoded)],
+    [bench.Function("array_text.decode", fn(d) { c.decode(d) })],
     [bench.Duration(duration), bench.Warmup(warmup)],
   )
 }

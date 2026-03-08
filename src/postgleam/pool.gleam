@@ -55,7 +55,7 @@ pub fn start(
       fn(subject) {
         case connect_pool(config, size, []) {
           Ok(conns) -> {
-            let reg = registry.build(defaults.matchers())
+            let reg = defaults.build_registry()
             let state =
               PoolState(
                 connections: conns,

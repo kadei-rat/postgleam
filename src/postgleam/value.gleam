@@ -56,6 +56,28 @@ pub type Value {
   Inet(family: Int, address: BitArray, netmask: Int)
   /// MAC address (6 bytes)
   Macaddr(BitArray)
+  /// MAC address EUI-64 (8 bytes)
+  Macaddr8(BitArray)
+  /// Money amount in smallest currency unit (e.g., cents)
+  Money(Int)
+  /// XML document
+  Xml(String)
+  /// JSONPath expression
+  Jsonpath(String)
+  /// Bit string with explicit bit count (bit/varbit)
+  BitString(bit_count: Int, data: BitArray)
+  /// Line: Ax + By + C = 0
+  Line(a: Float, b: Float, c: Float)
+  /// Line segment: two endpoints
+  Lseg(x1: Float, y1: Float, x2: Float, y2: Float)
+  /// Box: upper-right and bottom-left corners
+  Box(x1: Float, y1: Float, x2: Float, y2: Float)
+  /// Path: closed/open flag + list of (x, y) points
+  Path(closed: Bool, points: List(#(Float, Float)))
+  /// Polygon: list of (x, y) vertices
+  Polygon(vertices: List(#(Float, Float)))
+  /// Circle: center (x, y) + radius
+  Circle(x: Float, y: Float, radius: Float)
 }
 
 /// Parse a UUID string into a Uuid value.
