@@ -94,6 +94,20 @@ pub fn query_with(
   }
 }
 
+/// Execute the same query with multiple param sets in a single pipeline.
+/// All Bind+Execute messages are sent together with a single Sync,
+/// eliminating N-1 round-trips compared to calling query() N times.
+/// Returns one result per param set.
+pub fn query_batch(
+  conn: Connection,
+  sql: String,
+  param_sets: List(List(Param)),
+) -> Result(List(ExtendedQueryResult), Error) {
+  process.call(conn.subject, conn.config.timeout, fn(reply) {
+    connection_actor.BatchQuery(sql, param_sets, reply)
+  })
+}
+
 /// Execute a query and return the first decoded row, or error if no rows.
 pub fn query_one(
   conn: Connection,
@@ -148,6 +162,32 @@ pub fn execute(
 pub fn close(conn: Connection, name: String) -> Result(Nil, Error) {
   process.call(conn.subject, conn.config.timeout, fn(reply) {
     connection_actor.CloseStatement(name, reply)
+  })
+}
+
+/// Bulk insert data using the COPY protocol.
+/// `sql` should be a COPY ... FROM STDIN statement.
+/// `data` is a list of text-format row chunks (each ending with \n).
+/// Returns the command tag (e.g., "COPY 1000").
+pub fn copy_in(
+  conn: Connection,
+  sql: String,
+  data: List(BitArray),
+) -> Result(String, Error) {
+  process.call(conn.subject, conn.config.timeout, fn(reply) {
+    connection_actor.CopyIn(sql, data, reply)
+  })
+}
+
+/// Export data using the COPY protocol.
+/// `sql` should be a COPY ... TO STDOUT statement.
+/// Returns the raw data chunks from PostgreSQL.
+pub fn copy_out(
+  conn: Connection,
+  sql: String,
+) -> Result(List(BitArray), Error) {
+  process.call(conn.subject, conn.config.timeout, fn(reply) {
+    connection_actor.CopyOut(sql, reply)
   })
 }
 

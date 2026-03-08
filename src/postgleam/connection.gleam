@@ -332,6 +332,124 @@ pub fn execute_prepared(
   ))
 }
 
+/// Execute a prepared statement with multiple param sets in a pipeline.
+/// Sends all Bind+Execute messages, then a single Sync — avoiding N-1
+/// round-trips compared to calling execute_prepared N times.
+pub fn execute_pipeline(
+  state: ConnectionState,
+  prepared: PreparedStatement,
+  param_sets: List(List(Option(Value))),
+  registry: Registry,
+  timeout: Int,
+) -> Result(#(List(ExtendedQueryResult), ConnectionState), Error) {
+  let param_formats =
+    list.map(prepared.param_oids, fn(_) { message.BinaryFormat })
+  let result_formats =
+    list.map(prepared.result_fields, fn(_) { message.BinaryFormat })
+
+  // Send all Bind+Execute pairs without Sync
+  use state <- result.try(send_pipeline_messages(
+    state,
+    prepared,
+    param_sets,
+    param_formats,
+    result_formats,
+    registry,
+  ))
+  // Single Sync at the end
+  use state <- result.try(send_message(state, message.Sync))
+
+  // Read all results
+  let decoders = resolve_row_decoders(prepared.result_fields, registry)
+  let count = list.length(param_sets)
+  use #(results, state) <- result.try(recv_pipeline_results(
+    state,
+    prepared,
+    decoders,
+    timeout,
+    count,
+    [],
+  ))
+  // Read final ReadyForQuery
+  use state <- result.try(
+    recv_ready_for_query(state, prepared.statement, timeout),
+  )
+  Ok(#(results, state))
+}
+
+fn send_pipeline_messages(
+  state: ConnectionState,
+  prepared: PreparedStatement,
+  param_sets: List(List(Option(Value))),
+  param_formats: List(message.Format),
+  result_formats: List(message.Format),
+  registry: Registry,
+) -> Result(ConnectionState, Error) {
+  case param_sets {
+    [] -> Ok(state)
+    [params, ..rest] -> {
+      use encoded_params <- result.try(
+        encode_params_binary(params, prepared.param_oids, registry),
+      )
+      use state <- result.try(send_message(
+        state,
+        message.Bind(
+          "",
+          prepared.name,
+          param_formats,
+          encoded_params,
+          result_formats,
+        ),
+      ))
+      use state <- result.try(send_message(state, message.Execute("", 0)))
+      send_pipeline_messages(
+        state,
+        prepared,
+        rest,
+        param_formats,
+        result_formats,
+        registry,
+      )
+    }
+  }
+}
+
+fn recv_pipeline_results(
+  state: ConnectionState,
+  prepared: PreparedStatement,
+  decoders: List(fn(BitArray) -> Result(Value, String)),
+  timeout: Int,
+  remaining: Int,
+  acc: List(ExtendedQueryResult),
+) -> Result(#(List(ExtendedQueryResult), ConnectionState), Error) {
+  case remaining {
+    0 -> Ok(#(list_reverse(acc), state))
+    _ -> {
+      // Each result: BindComplete + DataRow* + CommandComplete
+      use state <- result.try(
+        recv_bind_complete(state, prepared.statement, timeout),
+      )
+      use #(tag, rows, state) <- result.try(
+        recv_execute_rows(state, prepared, decoders, timeout, []),
+      )
+      let result =
+        ExtendedQueryResult(
+          tag: tag,
+          columns: prepared.result_fields,
+          rows: list_reverse(rows),
+        )
+      recv_pipeline_results(
+        state,
+        prepared,
+        decoders,
+        timeout,
+        remaining - 1,
+        [result, ..acc],
+      )
+    }
+  }
+}
+
 /// Close a prepared statement: Close + Sync
 pub fn close_statement(
   state: ConnectionState,

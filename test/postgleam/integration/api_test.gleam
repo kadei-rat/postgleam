@@ -1,3 +1,4 @@
+import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
 import gleeunit/should
@@ -555,6 +556,94 @@ pub fn uuid_gen_random_decode_test() {
 
   // Should be 36 chars in hyphenated format
   should.equal(string.length(uuid_str), 36)
+  postgleam.disconnect(conn)
+}
+
+// =============================================================================
+// DX: query_batch (pipelined batch execution)
+// =============================================================================
+
+pub fn query_batch_insert_test() {
+  let cfg = test_config()
+  let assert Ok(conn) = postgleam.connect(cfg)
+
+  let assert Ok(_) =
+    postgleam.simple_query(
+      conn,
+      "CREATE TEMP TABLE _batch_test (id int4 PRIMARY KEY, name text)",
+    )
+
+  // Insert 5 rows in a single pipeline
+  let param_sets = [
+    [postgleam.int(1), postgleam.text("alice")],
+    [postgleam.int(2), postgleam.text("bob")],
+    [postgleam.int(3), postgleam.text("charlie")],
+    [postgleam.int(4), postgleam.text("diana")],
+    [postgleam.int(5), postgleam.text("eve")],
+  ]
+
+  let assert Ok(results) =
+    postgleam.query_batch(
+      conn,
+      "INSERT INTO _batch_test (id, name) VALUES ($1, $2)",
+      param_sets,
+    )
+
+  // Should get 5 results, each with "INSERT 0 1" tag
+  should.equal(list.length(results), 5)
+  list.each(results, fn(r) { should.equal(r.tag, "INSERT 0 1") })
+
+  // Verify all rows were inserted
+  let decoder = {
+    use id <- decode.element(0, decode.int)
+    decode.success(id)
+  }
+  let assert Ok(response) =
+    postgleam.query_with(
+      conn,
+      "SELECT id FROM _batch_test ORDER BY id",
+      [],
+      decoder,
+    )
+
+  should.equal(response.rows, [1, 2, 3, 4, 5])
+  postgleam.disconnect(conn)
+}
+
+pub fn query_batch_select_test() {
+  let cfg = test_config()
+  let assert Ok(conn) = postgleam.connect(cfg)
+
+  // Batch of SELECT queries
+  let param_sets = [
+    [postgleam.int(10)],
+    [postgleam.int(20)],
+    [postgleam.int(30)],
+  ]
+
+  let assert Ok(results) =
+    postgleam.query_batch(
+      conn,
+      "SELECT $1::int4 * 2 AS doubled",
+      param_sets,
+    )
+
+  should.equal(list.length(results), 3)
+  let assert [r1, r2, r3] = results
+  should.equal(r1.rows, [[Some(value.Integer(20))]])
+  should.equal(r2.rows, [[Some(value.Integer(40))]])
+  should.equal(r3.rows, [[Some(value.Integer(60))]])
+  postgleam.disconnect(conn)
+}
+
+pub fn query_batch_empty_test() {
+  let cfg = test_config()
+  let assert Ok(conn) = postgleam.connect(cfg)
+
+  let assert Ok(results) =
+    postgleam.query_batch(conn, "SELECT 1::int4", [])
+
+  should.equal(results, [])
   postgleam.disconnect(conn)
 }
 

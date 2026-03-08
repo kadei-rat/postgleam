@@ -1,5 +1,5 @@
 -module(bench_ffi).
--export([get_args/0, git_commit_hash/0, timestamp_iso8601/0, write_file/2, read_file/1, now_ms/0]).
+-export([get_args/0, git_commit_hash/0, timestamp_iso8601/0, write_file/2, read_file/1, delete_file/1, now_ms/0]).
 
 get_args() ->
     [list_to_binary(A) || A <- init:get_plain_arguments()].
@@ -19,6 +19,12 @@ write_file(Path, Content) ->
 read_file(Path) ->
     case file:read_file(Path) of
         {ok, Content} -> {ok, Content};
+        {error, Reason} -> {error, atom_to_binary(Reason)}
+    end.
+
+delete_file(Path) ->
+    case file:delete(Path) of
+        ok -> {ok, nil};
         {error, Reason} -> {error, atom_to_binary(Reason)}
     end.
 

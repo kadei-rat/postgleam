@@ -7,8 +7,11 @@
 ///   3. many     — Insert N users, query all 1000 times (read-heavy)
 ///   4. large    — Insert 1000 users with large text columns, query all
 
+import bench/runner
+import gleam/dynamic/decode as dyn_decode
 import gleam/int
 import gleam/io
+import gleam/json
 import gleam/list
 import gleam/string
 import postgleam
@@ -21,7 +24,12 @@ pub type RealworldResult {
   RealworldResult(name: String, insert_ms: Int, query_ms: Int)
 }
 
+const results_path = "bench/results/realworld.json"
+
 pub fn run(cfg: Config) -> List(RealworldResult) {
+  // Load previous results for comparison
+  let previous = load_previous_results()
+
   io.println("Running real-world benchmarks...")
   io.println("")
   let results = [
@@ -35,6 +43,16 @@ pub fn run(cfg: Config) -> List(RealworldResult) {
     bench_large(cfg, 10_000),
   ]
   print_realworld_table(results)
+
+  // Show comparison with previous results if available
+  case previous {
+    Ok(prev) -> print_comparison(prev, results)
+    Error(_) -> Nil
+  }
+
+  // Save results
+  save_results(results)
+
   results
 }
 
@@ -65,11 +83,11 @@ fn bench_simple(cfg: Config, nusers: Int) -> RealworldResult {
       "CREATE INDEX bench_users_created ON bench_users(created)",
     )
 
-  // Insert N users in a single transaction
+  // Insert N users in a single transaction using pipelined batches
   let t0 = now_ms()
   let assert Ok(_) =
     postgleam.transaction(conn, fn(c) {
-      insert_users_loop(c, 1, nusers)
+      insert_users_batched(c, 1, nusers, 1000)
     })
   let insert_ms = now_ms() - t0
 
@@ -99,28 +117,44 @@ fn bench_simple(cfg: Config, nusers: Int) -> RealworldResult {
   RealworldResult(name: label, insert_ms: insert_ms, query_ms: query_ms)
 }
 
-fn insert_users_loop(
+fn insert_users_batched(
   conn: postgleam.Connection,
   current: Int,
   max: Int,
+  batch_size: Int,
 ) -> Result(Nil, Error) {
   case current > max {
     True -> Ok(Nil)
     False -> {
-      let email =
-        "user" <> pad_int(current, 8) <> "@example.com"
+      let end = int.min(current + batch_size - 1, max)
+      let params = build_user_params(current, end, [])
       let assert Ok(_) =
-        postgleam.query(
+        postgleam.query_batch(
           conn,
           "INSERT INTO bench_users (id, created, email, active) VALUES ($1, $2, $3, $4)",
-          [
-            postgleam.int(current),
-            postgleam.int(current * 60_000),
-            postgleam.text(email),
-            postgleam.bool(True),
-          ],
+          params,
         )
-      insert_users_loop(conn, current + 1, max)
+      insert_users_batched(conn, end + 1, max, batch_size)
+    }
+  }
+}
+
+fn build_user_params(
+  current: Int,
+  max: Int,
+  acc: List(List(postgleam.Param)),
+) -> List(List(postgleam.Param)) {
+  case current > max {
+    True -> list.reverse(acc)
+    False -> {
+      let email = "user" <> pad_int(current, 8) <> "@example.com"
+      let params = [
+        postgleam.int(current),
+        postgleam.int(current * 60_000),
+        postgleam.text(email),
+        postgleam.bool(True),
+      ]
+      build_user_params(current + 1, max, [params, ..acc])
     }
   }
 }
@@ -401,11 +435,18 @@ fn bench_many(cfg: Config, nusers: Int) -> RealworldResult {
       )",
     )
 
-  // Insert
+  // Insert using pipelined batch
   let t0 = now_ms()
   let assert Ok(_) =
     postgleam.transaction(conn, fn(c) {
-      insert_users_many_loop(c, 1, nusers)
+      let params = build_user_params(1, nusers, [])
+      let assert Ok(_) =
+        postgleam.query_batch(
+          c,
+          "INSERT INTO bench_many_users (id, created, email, active) VALUES ($1, $2, $3, $4)",
+          params,
+        )
+      Ok(Nil)
     })
   let insert_ms = now_ms() - t0
 
@@ -426,31 +467,6 @@ fn bench_many(cfg: Config, nusers: Int) -> RealworldResult {
   postgleam.disconnect(conn)
 
   RealworldResult(name: label, insert_ms: insert_ms, query_ms: query_ms)
-}
-
-fn insert_users_many_loop(
-  conn: postgleam.Connection,
-  current: Int,
-  max: Int,
-) -> Result(Nil, Error) {
-  case current > max {
-    True -> Ok(Nil)
-    False -> {
-      let email = "user" <> pad_int(current, 8) <> "@example.com"
-      let assert Ok(_) =
-        postgleam.query(
-          conn,
-          "INSERT INTO bench_many_users (id, created, email, active) VALUES ($1, $2, $3, $4)",
-          [
-            postgleam.int(current),
-            postgleam.int(current * 60_000),
-            postgleam.text(email),
-            postgleam.bool(True),
-          ],
-        )
-      insert_users_many_loop(conn, current + 1, max)
-    }
-  }
 }
 
 fn query_many_loop(
@@ -504,12 +520,12 @@ fn bench_large(cfg: Config, nusers: Int) -> RealworldResult {
       )",
     )
 
-  // Insert users with ~1KB email field
+  // Insert users with ~1KB email field using pipelined batches
   let big_email = string.repeat("a", 1000)
   let t0 = now_ms()
   let assert Ok(_) =
     postgleam.transaction(conn, fn(c) {
-      insert_large_loop(c, 1, nusers, big_email)
+      insert_large_batched(c, 1, nusers, big_email, 1000)
     })
   let insert_ms = now_ms() - t0
 
@@ -539,27 +555,45 @@ fn bench_large(cfg: Config, nusers: Int) -> RealworldResult {
   RealworldResult(name: label, insert_ms: insert_ms, query_ms: query_ms)
 }
 
-fn insert_large_loop(
+fn insert_large_batched(
   conn: postgleam.Connection,
   current: Int,
   max: Int,
   big_email: String,
+  batch_size: Int,
 ) -> Result(Nil, Error) {
   case current > max {
     True -> Ok(Nil)
     False -> {
+      let end = int.min(current + batch_size - 1, max)
+      let params = build_large_params(current, end, big_email, [])
       let assert Ok(_) =
-        postgleam.query(
+        postgleam.query_batch(
           conn,
           "INSERT INTO bench_large_users (id, created, email, active) VALUES ($1, $2, $3, $4)",
-          [
-            postgleam.int(current),
-            postgleam.int(current * 1000),
-            postgleam.text(big_email),
-            postgleam.bool(True),
-          ],
+          params,
         )
-      insert_large_loop(conn, current + 1, max, big_email)
+      insert_large_batched(conn, end + 1, max, big_email, batch_size)
+    }
+  }
+}
+
+fn build_large_params(
+  current: Int,
+  max: Int,
+  big_email: String,
+  acc: List(List(postgleam.Param)),
+) -> List(List(postgleam.Param)) {
+  case current > max {
+    True -> list.reverse(acc)
+    False -> {
+      let params = [
+        postgleam.int(current),
+        postgleam.int(current * 1000),
+        postgleam.text(big_email),
+        postgleam.bool(True),
+      ]
+      build_large_params(current + 1, max, big_email, [params, ..acc])
     }
   }
 }
@@ -617,5 +651,161 @@ fn pad_right(s: String, width: Int) -> String {
   }
 }
 
+// =============================================================================
+// Save / Load / Compare
+// =============================================================================
+
+fn save_results(results: List(RealworldResult)) -> Nil {
+  let commit = git_commit_hash()
+  let timestamp = timestamp_iso8601()
+  let content =
+    json.object([
+      #("commit", json.string(commit)),
+      #("timestamp", json.string(timestamp)),
+      #(
+        "results",
+        json.array(results, fn(r) {
+          json.object([
+            #("name", json.string(r.name)),
+            #("insert_ms", json.int(r.insert_ms)),
+            #("query_ms", json.int(r.query_ms)),
+          ])
+        }),
+      ),
+    ])
+    |> json.to_string
+
+  case write_file(results_path, content) {
+    Ok(_) -> io.println("Results written to " <> results_path)
+    Error(e) -> io.println("Failed to write results: " <> e)
+  }
+
+  // Also save per-commit snapshot
+  let commit_path =
+    string.replace(results_path, ".json", "-" <> commit <> ".json")
+  case write_file(commit_path, content) {
+    Ok(_) -> io.println("Snapshot written to " <> commit_path)
+    Error(_) -> Nil
+  }
+}
+
+fn load_previous_results() -> Result(List(RealworldResult), Nil) {
+  case runner.read_file(results_path) {
+    Ok(content) -> parse_realworld_json(content)
+    Error(_) -> Error(Nil)
+  }
+}
+
+fn parse_realworld_json(
+  raw: String,
+) -> Result(List(RealworldResult), Nil) {
+  let result_decoder =
+    {
+      use name <- dyn_decode.field("name", dyn_decode.string)
+      use insert_ms <- dyn_decode.field("insert_ms", dyn_decode.int)
+      use query_ms <- dyn_decode.field("query_ms", dyn_decode.int)
+      dyn_decode.success(RealworldResult(
+        name: name,
+        insert_ms: insert_ms,
+        query_ms: query_ms,
+      ))
+    }
+
+  let report_decoder =
+    dyn_decode.field(
+      "results",
+      dyn_decode.list(result_decoder),
+      fn(results) { dyn_decode.success(results) },
+    )
+
+  case json.parse(raw, report_decoder) {
+    Ok(results) -> Ok(results)
+    Error(_) -> Error(Nil)
+  }
+}
+
+fn print_comparison(
+  previous: List(RealworldResult),
+  current: List(RealworldResult),
+) -> Nil {
+  io.println("")
+  io.println("Comparison with previous run:")
+  io.println(string.repeat("=", 80))
+  io.println(
+    pad_right("Benchmark", 20)
+    <> pad_right("Prev Insert", 13)
+    <> pad_right("Curr Insert", 13)
+    <> pad_right("Prev Query", 13)
+    <> pad_right("Curr Query", 13)
+    <> "Delta",
+  )
+  io.println(string.repeat("-", 80))
+
+  list.each(current, fn(curr) {
+    let prev_match =
+      list.find(previous, fn(p) { p.name == curr.name })
+
+    case prev_match {
+      Ok(prev) -> {
+        let prev_total = prev.insert_ms + prev.query_ms
+        let curr_total = curr.insert_ms + curr.query_ms
+        let delta = case prev_total > 0 {
+          True -> {
+            let pct =
+              { { curr_total - prev_total } * 100 } / prev_total
+            case pct >= 0 {
+              True -> "+" <> int.to_string(pct) <> "%"
+              False -> int.to_string(pct) <> "%"
+            }
+          }
+          False -> "N/A"
+        }
+        let status = case prev_total > 0 {
+          True -> {
+            let pct =
+              { { curr_total - prev_total } * 100 } / prev_total
+            case pct {
+              p if p < -5 -> " FASTER"
+              p if p > 5 -> " SLOWER"
+              _ -> " ~"
+            }
+          }
+          False -> ""
+        }
+        io.println(
+          pad_right(curr.name, 20)
+          <> pad_right(int.to_string(prev.insert_ms), 13)
+          <> pad_right(int.to_string(curr.insert_ms), 13)
+          <> pad_right(int.to_string(prev.query_ms), 13)
+          <> pad_right(int.to_string(curr.query_ms), 13)
+          <> delta
+          <> status,
+        )
+      }
+      Error(_) -> {
+        io.println(
+          pad_right(curr.name, 20)
+          <> pad_right("NEW", 13)
+          <> pad_right(int.to_string(curr.insert_ms), 13)
+          <> pad_right("NEW", 13)
+          <> pad_right(int.to_string(curr.query_ms), 13)
+          <> "NEW",
+        )
+      }
+    }
+  })
+
+  io.println("")
+}
+
 @external(erlang, "bench_ffi", "now_ms")
 fn now_ms() -> Int
+
+@external(erlang, "bench_ffi", "git_commit_hash")
+fn git_commit_hash() -> String
+
+@external(erlang, "bench_ffi", "timestamp_iso8601")
+fn timestamp_iso8601() -> String
+
+@external(erlang, "bench_ffi", "write_file")
+fn write_file(path: String, content: String) -> Result(Nil, String)
