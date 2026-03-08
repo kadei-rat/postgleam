@@ -1,5 +1,5 @@
 name = "postgleam"
-version = "0.3.0"
+version = "0.4.0"
 description = "A native Gleam PostgreSQL driver implementing the wire protocol"
 licences = ["Apache-2.0"]
 repository = { type = "github", user = "uncle-samm", repo = "postgleam" }
