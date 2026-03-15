@@ -82,9 +82,19 @@ pub fn int(val: Option(Value)) -> Result(Int, Error) {
 }
 
 /// Decode a text/string value.
+/// Also coerces UUID and Boolean values to their string representation,
+/// since sqlc's `uuidAsString` option and `any` pseudotype generate
+/// `decode.text` for columns that PostgreSQL returns as UUID or Bool.
 pub fn text(val: Option(Value)) -> Result(String, Error) {
   case val {
     Some(value.Text(s)) -> Ok(s)
+    Some(value.Boolean(True)) -> Ok("true")
+    Some(value.Boolean(False)) -> Ok("false")
+    Some(value.Uuid(_) as u) ->
+      case value.uuid_to_string(u) {
+        Ok(s) -> Ok(s)
+        Error(_) -> Error(error.DecodeError("Failed to format UUID as string"))
+      }
     Some(other) ->
       Error(error.DecodeError("Expected Text, got " <> value_type_name(other)))
     None -> Error(error.DecodeError("Expected Text, got NULL"))
