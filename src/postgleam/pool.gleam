@@ -5,10 +5,11 @@
 import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/list
-import gleam/option.{type Option}
+import gleam/option.{type Option, Some}
 import gleam/otp/actor
 import postgleam/codec/defaults
 import postgleam/codec/registry.{type Registry}
+import postgleam/codec/text
 import postgleam/config.{type Config}
 import postgleam/connection.{
   type ConnectionState, type ExtendedQueryResult, type SimpleQueryResult,
@@ -101,6 +102,8 @@ pub fn start(
         case connect_pool(config, size, []) {
           Ok(conns) -> {
             let reg = defaults.build_registry()
+            // Auto-discover custom enum types and register them
+            let #(reg, conns) = discover_enum_types(conns, reg, config)
             let slots = list.map(conns, fn(c) { Active(c) })
             let state =
               PoolState(
@@ -147,6 +150,48 @@ fn connect_pool(
           Error(e)
         }
       }
+  }
+}
+
+/// Query pg_type for custom enum types and register their OIDs with
+/// the text codec. Enums are text-representable on the wire — their
+/// binary format is the enum label as UTF-8, identical to the text codec.
+fn discover_enum_types(
+  conns: List(ConnectionState),
+  reg: Registry,
+  config: Config,
+) -> #(Registry, List(ConnectionState)) {
+  case conns {
+    [first, ..rest] -> {
+      case
+        connection.simple_query(
+          first,
+          "SELECT oid::text FROM pg_type WHERE typtype = 'e'",
+          config.timeout,
+        )
+      {
+        Ok(#(results, updated_first)) -> {
+          let reg = case results {
+            [result, ..] ->
+              list.fold(result.rows, reg, fn(reg, row) {
+                case row {
+                  [Some(oid_str), ..] ->
+                    case int.parse(oid_str) {
+                      Ok(oid) -> registry.register(reg, oid, text.matcher())
+                      Error(_) -> reg
+                    }
+                  _ -> reg
+                }
+              })
+            _ -> reg
+          }
+          #(reg, [updated_first, ..rest])
+        }
+        // If discovery fails, proceed with the base registry
+        Error(_) -> #(reg, conns)
+      }
+    }
+    [] -> #(reg, conns)
   }
 }
 
