@@ -89,15 +89,24 @@ pub type ActorState {
 pub fn start(
   config: Config,
 ) -> Result(actor.Started(Subject(Message)), actor.StartError) {
+  start_with_registry(config, defaults.build_registry())
+}
+
+/// Start the connection actor with a pre-built registry.
+/// Used by the pool to share an enriched registry (with enum OIDs etc.)
+/// across all connection actors.
+pub fn start_with_registry(
+  config: Config,
+  registry: Registry,
+) -> Result(actor.Started(Subject(Message)), actor.StartError) {
   actor.new_with_initialiser(config.connect_timeout + 1000, fn(subject) {
     case connection.connect(config) {
       Ok(conn) -> {
-        let reg = defaults.build_registry()
         let state =
           ActorState(
             conn: conn,
             config: config,
-            registry: reg,
+            registry: registry,
             cache: dict.new(),
             cache_order: [],
             next_id: 0,
