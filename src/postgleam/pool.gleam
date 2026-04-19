@@ -1,12 +1,17 @@
 /// Connection pool - manages multiple PostgreSQL connections.
 /// Each connection is an independent actor/process, enabling true parallel
 /// query execution across N connections.
+///
+/// On systemic failure (2+ health checks fail, e.g. after VM suspend/resume),
+/// the pool recycles all connections and signals in-flight callers to retry
+/// on fresh connections.
 
 import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, Some}
 import gleam/otp/actor
+import parallel_map
 import postgleam/codec/defaults
 import postgleam/codec/registry.{type Registry}
 import postgleam/codec/text
@@ -17,6 +22,8 @@ import postgleam/error.{type Error}
 import postgleam/internal/connection_actor
 import postgleam/value.{type Value}
 
+const health_check_timeout = 2000
+
 /// Monotonic time in milliseconds (for queue timeout tracking).
 @external(erlang, "postgleam_ffi", "monotonic_time_ms")
 fn monotonic_time_ms() -> Int
@@ -26,6 +33,7 @@ pub type PoolMessage {
   /// Request a connection actor from the pool
   Checkout(
     reply: Subject(Result(#(Int, Subject(connection_actor.Message)), Error)),
+    abort: Subject(Nil),
   )
   /// Return a connection actor to the pool
   Checkin(index: Int, is_dead: Bool)
@@ -33,8 +41,8 @@ pub type PoolMessage {
   Shutdown(reply: Subject(Nil))
   /// Internal: periodic health check
   HealthCheck
-  /// Internal: health check detected a dead connection
-  HealthCheckFailed(index: Int)
+  /// Internal: batch health check results — list of failed slot indices
+  HealthCheckResults(failed: List(Int))
   /// Internal: reconnect a slot
   Reconnect(index: Int)
 }
@@ -44,7 +52,11 @@ type ConnectionSlot {
   /// Idle, available for checkout
   Active(subject: Subject(connection_actor.Message))
   /// Checked out to a caller
-  CheckedOut(subject: Subject(connection_actor.Message), since: Int)
+  CheckedOut(
+    subject: Subject(connection_actor.Message),
+    since: Int,
+    abort: Subject(Nil),
+  )
   /// Dead, attempting to reconnect
   Reconnecting(attempts: Int)
 }
@@ -53,6 +65,7 @@ type ConnectionSlot {
 type QueuedCheckout {
   QueuedCheckout(
     reply: Subject(Result(#(Int, Subject(connection_actor.Message)), Error)),
+    abort: Subject(Nil),
     enqueued_at: Int,
   )
 }
@@ -67,6 +80,13 @@ type PoolState {
     self: Subject(PoolMessage),
     queue: List(QueuedCheckout),
   )
+}
+
+/// Outcome of racing a query against an abort signal.
+type RaceOutcome(a) {
+  Completed(a)
+  Aborted
+  TimedOut
 }
 
 /// Start a connection pool with the given config and size
@@ -192,19 +212,21 @@ fn handle_message(
   msg: PoolMessage,
 ) -> actor.Next(PoolState, PoolMessage) {
   case msg {
-    Checkout(reply) -> {
+    Checkout(reply, abort) -> {
       case find_available(state.slots, 0) {
         Ok(#(index, subject)) -> {
           let now = monotonic_time_ms()
           let slots =
-            set_slot(state.slots, index, CheckedOut(subject, now))
+            set_slot(state.slots, index, CheckedOut(subject, now, abort))
           process.send(reply, Ok(#(index, subject)))
           actor.continue(PoolState(..state, slots: slots))
         }
         Error(_) -> {
           let now = monotonic_time_ms()
           let queue =
-            append(state.queue, [QueuedCheckout(reply: reply, enqueued_at: now)])
+            append(state.queue, [
+              QueuedCheckout(reply: reply, abort: abort, enqueued_at: now),
+            ])
           actor.continue(PoolState(..state, queue: queue))
         }
       }
@@ -212,7 +234,7 @@ fn handle_message(
 
     Checkin(index, is_dead) -> {
       case get_slot(state.slots, index) {
-        Ok(CheckedOut(subject, _)) -> {
+        Ok(CheckedOut(subject, _, _)) -> {
           case is_dead {
             True -> {
               process.send(
@@ -239,8 +261,33 @@ fn handle_message(
 
     HealthCheck -> {
       let now = monotonic_time_ms()
-      // Ping idle connections, reclaim stale checkouts
-      let state = health_check_slots(state, state.slots, 0, [], now)
+      // Reclaim slots checked out for too long (caller probably crashed)
+      let state = reclaim_stale_checkouts(state, state.slots, 0, [], now)
+      // Run health checks on idle connections in parallel (non-blocking)
+      let active_slots = collect_active_slots(state.slots, 0)
+      let pool = state.self
+      process.spawn(fn() {
+        let results =
+          parallel_map.list_pmap(
+            active_slots,
+            fn(slot) {
+              let #(_index, subject) = slot
+              let subj = process.new_subject()
+              process.send(
+                subject,
+                connection_actor.SimpleQuery("SELECT 1", subj),
+              )
+              case process.receive(subj, health_check_timeout) {
+                Ok(Ok(_)) -> True
+                _ -> False
+              }
+            },
+            parallel_map.MatchSchedulersOnline,
+            health_check_timeout + 500,
+          )
+        let failed = collect_failed_indices(active_slots, results)
+        process.send(pool, HealthCheckResults(failed))
+      })
       // Expire timed-out queue entries
       let state = expire_queue(state)
       let _ =
@@ -248,18 +295,40 @@ fn handle_message(
       actor.continue(state)
     }
 
-    HealthCheckFailed(index) -> {
-      case get_slot(state.slots, index) {
-        Ok(Active(subject)) -> {
-          process.send(
-            subject,
-            connection_actor.Disconnect(process.new_subject()),
-          )
-          let slots = set_slot(state.slots, index, Reconnecting(0))
-          let _ = process.send_after(state.self, 0, Reconnect(index))
-          actor.continue(PoolState(..state, slots: slots))
+    HealthCheckResults(failed) -> {
+      case list.length(failed) {
+        0 -> actor.continue(state)
+        1 -> {
+          // Single failure — recycle just that slot
+          let assert [index] = failed
+          case get_slot(state.slots, index) {
+            Ok(Active(subject)) -> {
+              process.send(
+                subject,
+                connection_actor.Disconnect(process.new_subject()),
+              )
+              let slots = set_slot(state.slots, index, Reconnecting(0))
+              let _ = process.send_after(state.self, 0, Reconnect(index))
+              actor.continue(PoolState(..state, slots: slots))
+            }
+            _ -> actor.continue(state)
+          }
         }
-        _ -> actor.continue(state)
+        _ -> {
+          case state.config.aggressive_reconnect {
+            True -> {
+              // Multiple failures — systemic issue, recycle ALL connections
+              // and signal in-flight callers to retry
+              let state = recycle_all(state)
+              actor.continue(state)
+            }
+            False -> {
+              // Recycle each failed slot individually
+              let state = recycle_failed_slots(state, failed)
+              actor.continue(state)
+            }
+          }
+        }
       }
     }
 
@@ -296,6 +365,61 @@ fn handle_message(
       process.send(reply, Nil)
       actor.stop()
     }
+  }
+}
+
+// =============================================================================
+// Recycle all connections (systemic failure recovery)
+// =============================================================================
+
+fn recycle_failed_slots(state: PoolState, failed: List(Int)) -> PoolState {
+  case failed {
+    [] -> state
+    [index, ..rest] -> {
+      let state = case get_slot(state.slots, index) {
+        Ok(Active(subject)) -> {
+          process.send(
+            subject,
+            connection_actor.Disconnect(process.new_subject()),
+          )
+          let slots = set_slot(state.slots, index, Reconnecting(0))
+          let _ = process.send_after(state.self, 0, Reconnect(index))
+          PoolState(..state, slots: slots)
+        }
+        _ -> state
+      }
+      recycle_failed_slots(state, rest)
+    }
+  }
+}
+
+fn recycle_all(state: PoolState) -> PoolState {
+  let slots = recycle_all_slots(state.slots, 0, [], state.self)
+  PoolState(..state, slots: slots)
+}
+
+fn recycle_all_slots(
+  slots: List(ConnectionSlot),
+  index: Int,
+  acc: List(ConnectionSlot),
+  pool_self: Subject(PoolMessage),
+) -> List(ConnectionSlot) {
+  case slots {
+    [] -> list.reverse(acc)
+    [Active(subject), ..rest] -> {
+      process.send(subject, connection_actor.Disconnect(process.new_subject()))
+      let _ = process.send_after(pool_self, 0, Reconnect(index))
+      recycle_all_slots(rest, index + 1, [Reconnecting(0), ..acc], pool_self)
+    }
+    [CheckedOut(subject, _, abort), ..rest] -> {
+      // Signal the in-flight caller to retry on a new connection
+      process.send(abort, Nil)
+      process.send(subject, connection_actor.Disconnect(process.new_subject()))
+      let _ = process.send_after(pool_self, 0, Reconnect(index))
+      recycle_all_slots(rest, index + 1, [Reconnecting(0), ..acc], pool_self)
+    }
+    [Reconnecting(n), ..rest] ->
+      recycle_all_slots(rest, index + 1, [Reconnecting(n), ..acc], pool_self)
   }
 }
 
@@ -337,11 +461,25 @@ fn set_slot(
   }
 }
 
+fn collect_active_slots(
+  slots: List(ConnectionSlot),
+  index: Int,
+) -> List(#(Int, Subject(connection_actor.Message))) {
+  case slots {
+    [] -> []
+    [Active(subject), ..rest] -> [
+      #(index, subject),
+      ..collect_active_slots(rest, index + 1)
+    ]
+    [_, ..rest] -> collect_active_slots(rest, index + 1)
+  }
+}
+
 // =============================================================================
 // Health checks
 // =============================================================================
 
-fn health_check_slots(
+fn reclaim_stale_checkouts(
   state: PoolState,
   slots: List(ConnectionSlot),
   index: Int,
@@ -350,25 +488,10 @@ fn health_check_slots(
 ) -> PoolState {
   case slots {
     [] -> PoolState(..state, slots: list.reverse(acc))
-    [Active(subject), ..rest] -> {
-      // Spawn a process to ping this idle connection
-      let pool = state.self
-      let i = index
-      process.spawn(fn() {
-        let subj = process.new_subject()
-        process.send(subject, connection_actor.SimpleQuery("SELECT 1", subj))
-        case process.receive(subj, 5000) {
-          Ok(Ok(_)) -> Nil
-          _ -> process.send(pool, HealthCheckFailed(i))
-        }
-      })
-      health_check_slots(state, rest, index + 1, [Active(subject), ..acc], now)
-    }
-    [CheckedOut(subject, since), ..rest] -> {
-      // Reclaim slots checked out for too long (caller probably crashed)
+    [CheckedOut(subject, since, _abort) as slot, ..rest] -> {
       case now - since > state.config.timeout * 2 {
         True ->
-          health_check_slots(
+          reclaim_stale_checkouts(
             state,
             rest,
             index + 1,
@@ -376,17 +499,26 @@ fn health_check_slots(
             now,
           )
         False ->
-          health_check_slots(
-            state,
-            rest,
-            index + 1,
-            [CheckedOut(subject, since), ..acc],
-            now,
-          )
+          reclaim_stale_checkouts(state, rest, index + 1, [slot, ..acc], now)
       }
     }
     [slot, ..rest] ->
-      health_check_slots(state, rest, index + 1, [slot, ..acc], now)
+      reclaim_stale_checkouts(state, rest, index + 1, [slot, ..acc], now)
+  }
+}
+
+fn collect_failed_indices(
+  slots: List(#(Int, Subject(connection_actor.Message))),
+  results: List(Result(Bool, Nil)),
+) -> List(Int) {
+  case slots, results {
+    [], _ -> []
+    _, [] -> []
+    [#(index, _), ..rest_slots], [result, ..rest_results] ->
+      case result {
+        Ok(True) -> collect_failed_indices(rest_slots, rest_results)
+        _ -> [index, ..collect_failed_indices(rest_slots, rest_results)]
+      }
   }
 }
 
@@ -419,7 +551,11 @@ fn drain_queue(state: PoolState) -> PoolState {
           case find_available(state.slots, 0) {
             Ok(#(index, subject)) -> {
               let slots =
-                set_slot(state.slots, index, CheckedOut(subject, now))
+                set_slot(
+                  state.slots,
+                  index,
+                  CheckedOut(subject, now, first.abort),
+                )
               process.send(first.reply, Ok(#(index, subject)))
               drain_queue(PoolState(..state, slots: slots, queue: rest))
             }
@@ -451,7 +587,7 @@ fn disconnect_all_slots(slots: List(ConnectionSlot)) -> Nil {
       process.send(subject, connection_actor.Disconnect(process.new_subject()))
       disconnect_all_slots(rest)
     }
-    [CheckedOut(subject, _), ..rest] -> {
+    [CheckedOut(subject, _, _), ..rest] -> {
       process.send(subject, connection_actor.Disconnect(process.new_subject()))
       disconnect_all_slots(rest)
     }
@@ -501,20 +637,73 @@ fn append(a: List(x), b: List(x)) -> List(x) {
 // Public API
 // =============================================================================
 
-/// Checkout a connection actor, run a function, and check it back in.
-/// Ensures the connection is always returned to the pool, even on timeout.
+/// Race a query reply against an abort signal from the pool.
+fn race_against_abort(
+  query_subj: Subject(a),
+  abort_subj: Subject(Nil),
+  timeout: Int,
+) -> RaceOutcome(a) {
+  let selector =
+    process.new_selector()
+    |> process.select_map(for: query_subj, mapping: Completed)
+    |> process.select_map(for: abort_subj, mapping: fn(_) { Aborted })
+  case process.selector_receive(from: selector, within: timeout) {
+    Ok(outcome) -> outcome
+    Error(Nil) -> TimedOut
+  }
+}
+
+/// Checkout a connection actor, send a query, race the result against
+/// the pool's abort signal, and check back in. Retries once on abort
+/// (the pool has already recycled connections by the time we retry).
 fn with_connection(
   pool: Subject(PoolMessage),
   timeout: Int,
-  run: fn(Subject(connection_actor.Message)) -> #(Result(a, Error), Bool),
+  send_query: fn(Subject(connection_actor.Message)) -> Subject(Result(a, Error)),
+  is_dead: fn(Result(a, Error)) -> Bool,
+) -> Result(a, Error) {
+  let abort = process.new_subject()
+  attempt_connection(pool, timeout, send_query, is_dead, abort, True)
+}
+
+fn attempt_connection(
+  pool: Subject(PoolMessage),
+  timeout: Int,
+  send_query: fn(Subject(connection_actor.Message)) -> Subject(Result(a, Error)),
+  is_dead: fn(Result(a, Error)) -> Bool,
+  abort: Subject(Nil),
+  may_retry: Bool,
 ) -> Result(a, Error) {
   let checkout_subj = process.new_subject()
-  process.send(pool, Checkout(checkout_subj))
+  process.send(pool, Checkout(checkout_subj, abort))
   case process.receive(checkout_subj, timeout) {
     Ok(Ok(#(index, actor))) -> {
-      let #(result, is_dead) = run(actor)
-      process.send(pool, Checkin(index, is_dead))
-      result
+      let reply_subj = send_query(actor)
+      case race_against_abort(reply_subj, abort, timeout) {
+        Completed(result) -> {
+          process.send(pool, Checkin(index, is_dead(result)))
+          result
+        }
+        Aborted -> {
+          process.send(pool, Checkin(index, True))
+          case may_retry {
+            True ->
+              attempt_connection(
+                pool,
+                timeout,
+                send_query,
+                is_dead,
+                abort,
+                False,
+              )
+            False -> Error(error.ConnectionError("connection recycled"))
+          }
+        }
+        TimedOut -> {
+          process.send(pool, Checkin(index, True))
+          Error(error.TimeoutError)
+        }
+      }
     }
     Ok(Error(e)) -> Error(e)
     Error(Nil) -> Error(error.TimeoutError)
@@ -528,14 +717,16 @@ pub fn query(
   params: List(Option(Value)),
   timeout: Int,
 ) -> Result(ExtendedQueryResult, Error) {
-  with_connection(pool, timeout, fn(actor) {
-    let subj = process.new_subject()
-    process.send(actor, connection_actor.Query(sql, params, subj))
-    case process.receive(subj, timeout) {
-      Ok(r) -> #(r, is_socket_error(r))
-      Error(Nil) -> #(Error(error.TimeoutError), True)
-    }
-  })
+  with_connection(
+    pool,
+    timeout,
+    fn(actor) {
+      let subj = process.new_subject()
+      process.send(actor, connection_actor.Query(sql, params, subj))
+      subj
+    },
+    is_socket_error,
+  )
 }
 
 /// Execute a simple query through the pool
@@ -544,14 +735,16 @@ pub fn simple_query(
   sql: String,
   timeout: Int,
 ) -> Result(List(SimpleQueryResult), Error) {
-  with_connection(pool, timeout, fn(actor) {
-    let subj = process.new_subject()
-    process.send(actor, connection_actor.SimpleQuery(sql, subj))
-    case process.receive(subj, timeout) {
-      Ok(r) -> #(r, is_simple_socket_error(r))
-      Error(Nil) -> #(Error(error.TimeoutError), True)
-    }
-  })
+  with_connection(
+    pool,
+    timeout,
+    fn(actor) {
+      let subj = process.new_subject()
+      process.send(actor, connection_actor.SimpleQuery(sql, subj))
+      subj
+    },
+    is_simple_socket_error,
+  )
 }
 
 /// Execute a parameterized query through the pool and decode rows.
