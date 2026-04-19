@@ -13,6 +13,7 @@ pub type Config {
     pgbouncer: Bool,
     idle_interval: Int,
     queue_timeout: Int,
+    aggressive_reconnect: Bool,
   )
 }
 
@@ -41,6 +42,7 @@ pub fn default() -> Config {
     pgbouncer: False,
     idle_interval: 1000,
     queue_timeout: 5000,
+    aggressive_reconnect: False,
   )
 }
 
@@ -103,4 +105,13 @@ pub fn idle_interval(config: Config, ms: Int) -> Config {
 /// Default: 5000ms.
 pub fn queue_timeout(config: Config, ms: Int) -> Config {
   Config(..config, queue_timeout: ms)
+}
+
+/// Enable aggressive reconnection for suspend/resume environments
+/// When enabled, if 2+ health checks fail simultaneously the pool assumes all
+/// connections are dead (e.g. after VM resume with stale TCP sockets), recycles
+/// every connection, and signals in-flight queries to retry on fresh ones.
+/// Default: False.
+pub fn aggressive_reconnect(config: Config, enabled: Bool) -> Config {
+  Config(..config, aggressive_reconnect: enabled)
 }
