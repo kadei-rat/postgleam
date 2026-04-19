@@ -42,8 +42,10 @@ pub type PoolMessage {
   Shutdown(reply: Subject(Nil))
   /// Internal: periodic health check
   HealthCheck
-  /// Internal: batch health check results — list of failed slot indices
-  HealthCheckResults(failed: List(Int))
+  /// Internal: batch health check results — list of (index, subject)
+  /// pairs that failed. The subject is from the snapshot at HC start and
+  /// is used to detect stale results (slot already recycled since HC started).
+  HealthCheckResults(failed: List(#(Int, Subject(connection_actor.Message))))
   /// Internal: reconnect a slot
   Reconnect(index: Int)
 }
@@ -80,6 +82,11 @@ type PoolState {
     size: Int,
     self: Subject(PoolMessage),
     queue: List(QueuedCheckout),
+    /// True while a spawned health-check batch is running. Prevents
+    /// overlapping HCs from piling up when checks are slow (e.g. dead
+    /// sockets), which otherwise produces duplicate HealthCheckResults
+    /// messages — each one triggering its own recycle.
+    health_check_in_flight: Bool,
   )
 }
 
@@ -121,6 +128,7 @@ pub fn start(
                 size: size,
                 self: subject,
                 queue: [],
+                health_check_in_flight: False,
               )
             let _ =
               process.send_after(subject, config.idle_interval, HealthCheck)
@@ -237,6 +245,12 @@ fn handle_message(
         Ok(CheckedOut(subject, _, _)) -> {
           case is_dead {
             True -> {
+              logging.log(
+                logging.Warning,
+                "postgleam pool: slot "
+                  <> int.to_string(index)
+                  <> " checked in dead by caller, recycling",
+              )
               process.send(
                 subject,
                 connection_actor.Disconnect(process.new_subject()),
@@ -261,53 +275,91 @@ fn handle_message(
       let now = monotonic_time_ms()
       // Reclaim slots checked out for too long (caller probably crashed)
       let state = reclaim_stale_checkouts(state, state.slots, 0, [], now)
-      // Run health checks on idle connections in parallel (non-blocking)
-      let active_slots = collect_active_slots(state.slots, 0)
-      let pool = state.self
-      process.spawn(fn() {
-        let results =
-          parallel_map.list_pmap(
-            active_slots,
-            fn(slot) {
-              let #(_index, subject) = slot
-              let subj = process.new_subject()
-              process.send(
-                subject,
-                connection_actor.SimpleQuery("SELECT 1", subj),
-              )
-              case process.receive(subj, health_check_timeout) {
-                Ok(Ok(_)) -> True
-                _ -> False
-              }
-            },
-            parallel_map.MatchSchedulersOnline,
-            health_check_timeout + 500,
-          )
-        let failed = collect_failed_indices(active_slots, results)
-        process.send(pool, HealthCheckResults(failed))
-      })
       // Expire timed-out queue entries
       let state = expire_queue(state)
+      // Always reschedule the next timer, even if we skip this run
       let _ =
         process.send_after(state.self, state.config.idle_interval, HealthCheck)
-      actor.continue(state)
+      case state.health_check_in_flight {
+        True -> {
+          // Prior HC hasn't returned results yet. Skipping avoids piling
+          // up duplicate HealthCheckResults when checks are slow.
+          logging.log(
+            logging.Debug,
+            "postgleam pool: HC skipped (prior check in flight)",
+          )
+          actor.continue(state)
+        }
+        False -> {
+          let active_slots = collect_active_slots(state.slots, 0)
+          case active_slots {
+            [] -> actor.continue(state)
+            _ -> {
+              let pool = state.self
+              process.spawn(fn() {
+                let results =
+                  parallel_map.list_pmap(
+                    active_slots,
+                    fn(slot) {
+                      let #(_index, subject) = slot
+                      let subj = process.new_subject()
+                      process.send(
+                        subject,
+                        connection_actor.SimpleQuery("SELECT 1", subj),
+                      )
+                      case process.receive(subj, health_check_timeout) {
+                        Ok(Ok(_)) -> True
+                        _ -> False
+                      }
+                    },
+                    parallel_map.MatchSchedulersOnline,
+                    health_check_timeout + 500,
+                  )
+                let failed = collect_failures(active_slots, results)
+                process.send(pool, HealthCheckResults(failed))
+              })
+              actor.continue(PoolState(..state, health_check_in_flight: True))
+            }
+          }
+        }
+      }
     }
 
     HealthCheckResults(failed) -> {
-      case list.length(failed) {
+      // Clear the in-flight flag so the next HC timer can run.
+      let state = PoolState(..state, health_check_in_flight: False)
+      // Drop entries whose slot has already been recycled: either the
+      // slot is no longer Active, or it's Active with a different Subject
+      // (a fresh actor after a recycle). Only true failures remain.
+      let #(live_failed, stale_count) =
+        filter_stale_failures(state.slots, failed, [], 0)
+      let n_failed = list.length(live_failed)
+      case stale_count > 0 {
+        True ->
+          logging.log(
+            logging.Warning,
+            "postgleam pool: HC results: "
+              <> int.to_string(list.length(failed))
+              <> " raw failure(s), "
+              <> int.to_string(stale_count)
+              <> " already recycled (stale)",
+          )
+        False -> Nil
+      }
+      case n_failed {
         0 -> actor.continue(state)
-        n_failed -> {
+        _ -> {
           logging.log(
             logging.Warning,
             "postgleam pool: "
               <> int.to_string(n_failed)
               <> " health check(s) failed (slots: "
-              <> format_int_list(failed)
+              <> format_int_list(live_failed)
               <> ")",
           )
           case n_failed {
             1 -> {
-              let assert [index] = failed
+              let assert [index] = live_failed
               logging.log(
                 logging.Warning,
                 "postgleam pool: recycling connection slot "
@@ -345,7 +397,7 @@ fn handle_message(
                       <> int.to_string(n_failed)
                       <> " failed connection slots",
                   )
-                  let state = recycle_failed_slots(state, failed)
+                  let state = recycle_failed_slots(state, live_failed)
                   actor.continue(state)
                 }
               }
@@ -362,12 +414,30 @@ fn handle_message(
             connection_actor.start_with_registry(state.config, state.registry)
           {
             Ok(started) -> {
+              logging.log(
+                logging.Info,
+                "postgleam pool: slot "
+                  <> int.to_string(index)
+                  <> " reconnected"
+                  <> case attempts {
+                    0 -> ""
+                    n -> " (after " <> int.to_string(n) <> " failed attempts)"
+                  },
+              )
               let slots = set_slot(state.slots, index, Active(started.data))
               let state = PoolState(..state, slots: slots)
               let state = drain_queue(state)
               actor.continue(state)
             }
             Error(_) -> {
+              logging.log(
+                logging.Warning,
+                "postgleam pool: slot "
+                  <> int.to_string(index)
+                  <> " reconnect attempt "
+                  <> int.to_string(attempts + 1)
+                  <> " failed",
+              )
               let delay = int.min(30_000, pow2(attempts) * 1000)
               let _ = process.send_after(state.self, delay, Reconnect(index))
               let slots =
@@ -511,7 +581,15 @@ fn reclaim_stale_checkouts(
     [] -> PoolState(..state, slots: list.reverse(acc))
     [CheckedOut(subject, since, _abort) as slot, ..rest] -> {
       case now - since > state.config.timeout * 2 {
-        True ->
+        True -> {
+          logging.log(
+            logging.Warning,
+            "postgleam pool: reclaiming stale CheckedOut slot "
+              <> int.to_string(index)
+              <> " (held for "
+              <> int.to_string(now - since)
+              <> "ms)",
+          )
           reclaim_stale_checkouts(
             state,
             rest,
@@ -519,6 +597,7 @@ fn reclaim_stale_checkouts(
             [Active(subject), ..acc],
             now,
           )
+        }
         False ->
           reclaim_stale_checkouts(state, rest, index + 1, [slot, ..acc], now)
       }
@@ -528,17 +607,45 @@ fn reclaim_stale_checkouts(
   }
 }
 
-fn collect_failed_indices(
+/// Pair each snapshotted slot with its HC result and return (index, subject)
+/// for the ones that failed.
+fn collect_failures(
   slots: List(#(Int, Subject(connection_actor.Message))),
   results: List(Result(Bool, Nil)),
-) -> List(Int) {
+) -> List(#(Int, Subject(connection_actor.Message))) {
   case slots, results {
     [], _ -> []
     _, [] -> []
-    [#(index, _), ..rest_slots], [result, ..rest_results] ->
+    [#(index, subject), ..rest_slots], [result, ..rest_results] ->
       case result {
-        Ok(True) -> collect_failed_indices(rest_slots, rest_results)
-        _ -> [index, ..collect_failed_indices(rest_slots, rest_results)]
+        Ok(True) -> collect_failures(rest_slots, rest_results)
+        _ -> [#(index, subject), ..collect_failures(rest_slots, rest_results)]
+      }
+  }
+}
+
+/// Drop failure entries whose slot has been recycled since the HC snapshot
+/// (slot is no longer Active, or Active with a different Subject — i.e. a
+/// fresh actor). Returns (live_failure_indices, stale_count).
+fn filter_stale_failures(
+  slots: List(ConnectionSlot),
+  failed: List(#(Int, Subject(connection_actor.Message))),
+  live_acc: List(Int),
+  stale_count: Int,
+) -> #(List(Int), Int) {
+  case failed {
+    [] -> #(list.reverse(live_acc), stale_count)
+    [#(index, snapshot_subject), ..rest] ->
+      case get_slot(slots, index) {
+        Ok(Active(current_subject)) if current_subject == snapshot_subject ->
+          filter_stale_failures(
+            slots,
+            rest,
+            [index, ..live_acc],
+            stale_count,
+          )
+        _ ->
+          filter_stale_failures(slots, rest, live_acc, stale_count + 1)
       }
   }
 }
