@@ -5,12 +5,13 @@
 /// On systemic failure (2+ health checks fail, e.g. after VM suspend/resume),
 /// the pool recycles all connections and signals in-flight callers to retry
 /// on fresh connections.
-
 import gleam/erlang/process.{type Subject}
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, Some}
 import gleam/otp/actor
+import gleam/string
+import logging
 import parallel_map
 import postgleam/codec/defaults
 import postgleam/codec/registry.{type Registry}
@@ -102,8 +103,7 @@ pub fn start(
         // Discover enum types using a temporary raw connection
         let reg = case connection.connect(config) {
           Ok(temp_conn) -> {
-            let #(reg, temp_conn) =
-              discover_enum_types(temp_conn, reg, config)
+            let #(reg, temp_conn) = discover_enum_types(temp_conn, reg, config)
             connection.disconnect(temp_conn)
             reg
           }
@@ -241,14 +241,12 @@ fn handle_message(
                 subject,
                 connection_actor.Disconnect(process.new_subject()),
               )
-              let slots =
-                set_slot(state.slots, index, Reconnecting(0))
+              let slots = set_slot(state.slots, index, Reconnecting(0))
               let _ = process.send_after(state.self, 0, Reconnect(index))
               actor.continue(PoolState(..state, slots: slots))
             }
             False -> {
-              let slots =
-                set_slot(state.slots, index, Active(subject))
+              let slots = set_slot(state.slots, index, Active(subject))
               let state = PoolState(..state, slots: slots)
               let state = drain_queue(state)
               actor.continue(state)
@@ -298,34 +296,59 @@ fn handle_message(
     HealthCheckResults(failed) -> {
       case list.length(failed) {
         0 -> actor.continue(state)
-        1 -> {
-          // Single failure — recycle just that slot
-          let assert [index] = failed
-          case get_slot(state.slots, index) {
-            Ok(Active(subject)) -> {
-              process.send(
-                subject,
-                connection_actor.Disconnect(process.new_subject()),
+        n_failed -> {
+          logging.log(
+            logging.Warning,
+            "postgleam pool: "
+              <> int.to_string(n_failed)
+              <> " health check(s) failed (slots: "
+              <> format_int_list(failed)
+              <> ")",
+          )
+          case n_failed {
+            1 -> {
+              let assert [index] = failed
+              logging.log(
+                logging.Warning,
+                "postgleam pool: recycling connection slot "
+                  <> int.to_string(index),
               )
-              let slots = set_slot(state.slots, index, Reconnecting(0))
-              let _ = process.send_after(state.self, 0, Reconnect(index))
-              actor.continue(PoolState(..state, slots: slots))
+              case get_slot(state.slots, index) {
+                Ok(Active(subject)) -> {
+                  process.send(
+                    subject,
+                    connection_actor.Disconnect(process.new_subject()),
+                  )
+                  let slots = set_slot(state.slots, index, Reconnecting(0))
+                  let _ = process.send_after(state.self, 0, Reconnect(index))
+                  actor.continue(PoolState(..state, slots: slots))
+                }
+                _ -> actor.continue(state)
+              }
             }
-            _ -> actor.continue(state)
-          }
-        }
-        _ -> {
-          case state.config.aggressive_reconnect {
-            True -> {
-              // Multiple failures — systemic issue, recycle ALL connections
-              // and signal in-flight callers to retry
-              let state = recycle_all(state)
-              actor.continue(state)
-            }
-            False -> {
-              // Recycle each failed slot individually
-              let state = recycle_failed_slots(state, failed)
-              actor.continue(state)
+            _ -> {
+              case state.config.aggressive_reconnect {
+                True -> {
+                  logging.log(
+                    logging.Warning,
+                    "postgleam pool: recycling ALL connections ("
+                      <> int.to_string(n_failed)
+                      <> " failures, aggressive_reconnect enabled)",
+                  )
+                  let state = recycle_all(state)
+                  actor.continue(state)
+                }
+                False -> {
+                  logging.log(
+                    logging.Warning,
+                    "postgleam pool: recycling "
+                      <> int.to_string(n_failed)
+                      <> " failed connection slots",
+                  )
+                  let state = recycle_failed_slots(state, failed)
+                  actor.continue(state)
+                }
+              }
             }
           }
         }
@@ -339,16 +362,14 @@ fn handle_message(
             connection_actor.start_with_registry(state.config, state.registry)
           {
             Ok(started) -> {
-              let slots =
-                set_slot(state.slots, index, Active(started.data))
+              let slots = set_slot(state.slots, index, Active(started.data))
               let state = PoolState(..state, slots: slots)
               let state = drain_queue(state)
               actor.continue(state)
             }
             Error(_) -> {
               let delay = int.min(30_000, pow2(attempts) * 1000)
-              let _ =
-                process.send_after(state.self, delay, Reconnect(index))
+              let _ = process.send_after(state.self, delay, Reconnect(index))
               let slots =
                 set_slot(state.slots, index, Reconnecting(attempts + 1))
               actor.continue(PoolState(..state, slots: slots))
@@ -624,6 +645,12 @@ fn pow2(n: Int) -> Int {
     0 -> 1
     _ -> 2 * pow2(n - 1)
   }
+}
+
+fn format_int_list(ints: List(Int)) -> String {
+  ints
+  |> list.map(int.to_string)
+  |> string.join(", ")
 }
 
 fn append(a: List(x), b: List(x)) -> List(x) {
