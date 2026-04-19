@@ -41,8 +41,10 @@ pub type PoolMessage {
   Shutdown(reply: Subject(Nil))
   /// Internal: periodic health check
   HealthCheck
-  /// Internal: batch health check results — list of failed slot indices
-  HealthCheckResults(failed: List(Int))
+  /// Internal: batch health check results — list of (index, subject)
+  /// pairs that failed. The subject is from the snapshot at HC start and
+  /// is used to detect stale results (slot already recycled since HC started).
+  HealthCheckResults(failed: List(#(Int, Subject(connection_actor.Message))))
   /// Internal: reconnect a slot
   Reconnect(index: Int)
 }
@@ -79,6 +81,11 @@ type PoolState {
     size: Int,
     self: Subject(PoolMessage),
     queue: List(QueuedCheckout),
+    /// True while a spawned health-check batch is running. Prevents
+    /// overlapping HCs from piling up when checks are slow (e.g. dead
+    /// sockets), which otherwise produces duplicate HealthCheckResults
+    /// messages — each one triggering its own recycle.
+    health_check_in_flight: Bool,
   )
 }
 
@@ -121,6 +128,7 @@ pub fn start(
                 size: size,
                 self: subject,
                 queue: [],
+                health_check_in_flight: False,
               )
             let _ =
               process.send_after(subject, config.idle_interval, HealthCheck)
@@ -263,44 +271,64 @@ fn handle_message(
       let now = monotonic_time_ms()
       // Reclaim slots checked out for too long (caller probably crashed)
       let state = reclaim_stale_checkouts(state, state.slots, 0, [], now)
-      // Run health checks on idle connections in parallel (non-blocking)
-      let active_slots = collect_active_slots(state.slots, 0)
-      let pool = state.self
-      process.spawn(fn() {
-        let results =
-          parallel_map.list_pmap(
-            active_slots,
-            fn(slot) {
-              let #(_index, subject) = slot
-              let subj = process.new_subject()
-              process.send(
-                subject,
-                connection_actor.SimpleQuery("SELECT 1", subj),
-              )
-              case process.receive(subj, health_check_timeout) {
-                Ok(Ok(_)) -> True
-                _ -> False
-              }
-            },
-            parallel_map.MatchSchedulersOnline,
-            health_check_timeout + 500,
-          )
-        let failed = collect_failed_indices(active_slots, results)
-        process.send(pool, HealthCheckResults(failed))
-      })
       // Expire timed-out queue entries
       let state = expire_queue(state)
+      // Always reschedule the next timer, even if we skip this run
       let _ =
         process.send_after(state.self, state.config.idle_interval, HealthCheck)
-      actor.continue(state)
+      case state.health_check_in_flight {
+        True -> {
+          // Prior HC hasn't returned results yet. Skipping avoids piling
+          // up duplicate HealthCheckResults when checks are slow.
+          actor.continue(state)
+        }
+        False -> {
+          let active_slots = collect_active_slots(state.slots, 0)
+          case active_slots {
+            [] -> actor.continue(state)
+            _ -> {
+              let pool = state.self
+              process.spawn(fn() {
+                let results =
+                  parallel_map.list_pmap(
+                    active_slots,
+                    fn(slot) {
+                      let #(_index, subject) = slot
+                      let subj = process.new_subject()
+                      process.send(
+                        subject,
+                        connection_actor.SimpleQuery("SELECT 1", subj),
+                      )
+                      case process.receive(subj, health_check_timeout) {
+                        Ok(Ok(_)) -> True
+                        _ -> False
+                      }
+                    },
+                    parallel_map.MatchSchedulersOnline,
+                    health_check_timeout + 500,
+                  )
+                let failed = collect_failures(active_slots, results)
+                process.send(pool, HealthCheckResults(failed))
+              })
+              actor.continue(PoolState(..state, health_check_in_flight: True))
+            }
+          }
+        }
+      }
     }
 
     HealthCheckResults(failed) -> {
-      case list.length(failed) {
+      // Clear the in-flight flag so the next HC timer can run.
+      let state = PoolState(..state, health_check_in_flight: False)
+      // Drop entries whose slot has already been recycled: either the
+      // slot is no longer Active, or it's Active with a different Subject
+      // (a fresh actor after a recycle). Only true failures remain.
+      let live_failed = filter_stale_failures(state.slots, failed, [])
+      case list.length(live_failed) {
         0 -> actor.continue(state)
         1 -> {
           // Single failure — recycle just that slot
-          let assert [index] = failed
+          let assert [index] = live_failed
           case get_slot(state.slots, index) {
             Ok(Active(subject)) -> {
               process.send(
@@ -324,7 +352,7 @@ fn handle_message(
             }
             False -> {
               // Recycle each failed slot individually
-              let state = recycle_failed_slots(state, failed)
+              let state = recycle_failed_slots(state, live_failed)
               actor.continue(state)
             }
           }
@@ -507,17 +535,38 @@ fn reclaim_stale_checkouts(
   }
 }
 
-fn collect_failed_indices(
+/// Pair each snapshotted slot with its HC result and return (index, subject)
+/// for the ones that failed.
+fn collect_failures(
   slots: List(#(Int, Subject(connection_actor.Message))),
   results: List(Result(Bool, Nil)),
-) -> List(Int) {
+) -> List(#(Int, Subject(connection_actor.Message))) {
   case slots, results {
     [], _ -> []
     _, [] -> []
-    [#(index, _), ..rest_slots], [result, ..rest_results] ->
+    [#(index, subject), ..rest_slots], [result, ..rest_results] ->
       case result {
-        Ok(True) -> collect_failed_indices(rest_slots, rest_results)
-        _ -> [index, ..collect_failed_indices(rest_slots, rest_results)]
+        Ok(True) -> collect_failures(rest_slots, rest_results)
+        _ -> [#(index, subject), ..collect_failures(rest_slots, rest_results)]
+      }
+  }
+}
+
+/// Drop failure entries whose slot has been recycled since the HC snapshot
+/// (slot is no longer Active, or Active with a different Subject — i.e. a
+/// fresh actor). Returns the live failure indices.
+fn filter_stale_failures(
+  slots: List(ConnectionSlot),
+  failed: List(#(Int, Subject(connection_actor.Message))),
+  live_acc: List(Int),
+) -> List(Int) {
+  case failed {
+    [] -> list.reverse(live_acc)
+    [#(index, snapshot_subject), ..rest] ->
+      case get_slot(slots, index) {
+        Ok(Active(current_subject)) if current_subject == snapshot_subject ->
+          filter_stale_failures(slots, rest, [index, ..live_acc])
+        _ -> filter_stale_failures(slots, rest, live_acc)
       }
   }
 }
