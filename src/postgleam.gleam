@@ -132,7 +132,7 @@ pub fn simple_query(
   sql: String,
 ) -> Result(List(SimpleQueryResult), Error) {
   process.call(conn.subject, conn.config.timeout, fn(reply) {
-    connection_actor.SimpleQuery(sql, reply)
+    connection_actor.SimpleQuery(sql, conn.config.timeout, reply)
   })
 }
 
