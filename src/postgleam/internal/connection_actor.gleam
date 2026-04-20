@@ -25,9 +25,13 @@ pub type Message {
     params: List(Option(Value)),
     reply: Subject(Result(ExtendedQueryResult, Error)),
   )
-  /// Execute a simple (text) query
+  /// Execute a simple (text) query. `timeout` is the per-call socket
+  /// timeout (ms) — lets callers (e.g. the pool's health check) bound
+  /// how long the actor blocks in `gen_tcp:recv` on a dead socket
+  /// instead of waiting for `config.timeout`.
   SimpleQuery(
     sql: String,
+    timeout: Int,
     reply: Subject(
       Result(List(connection.SimpleQueryResult), Error),
     ),
@@ -237,8 +241,8 @@ fn handle_message(
       }
     }
 
-    SimpleQuery(sql, reply) -> {
-      case connection.simple_query(state.conn, sql, state.config.timeout) {
+    SimpleQuery(sql, timeout, reply) -> {
+      case connection.simple_query(state.conn, sql, timeout) {
         Ok(#(results, conn)) -> {
           process.send(reply, Ok(results))
           actor.continue(ActorState(..state, conn: conn))

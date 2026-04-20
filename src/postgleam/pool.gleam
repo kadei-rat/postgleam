@@ -296,6 +296,10 @@ fn handle_message(
             [] -> actor.continue(state)
             _ -> {
               let pool = state.self
+              // One worker per slot so checks run in true parallel.
+              // `MatchSchedulersOnline` would collapse to a single worker
+              // on 1-CPU VMs, serialising N × health_check_timeout.
+              let num_workers = list.length(active_slots)
               process.spawn(fn() {
                 let results =
                   parallel_map.list_pmap(
@@ -305,15 +309,19 @@ fn handle_message(
                       let subj = process.new_subject()
                       process.send(
                         subject,
-                        connection_actor.SimpleQuery("SELECT 1", subj),
+                        connection_actor.SimpleQuery(
+                          "SELECT 1",
+                          health_check_timeout,
+                          subj,
+                        ),
                       )
-                      case process.receive(subj, health_check_timeout) {
+                      case process.receive(subj, health_check_timeout + 500) {
                         Ok(Ok(_)) -> True
                         _ -> False
                       }
                     },
-                    parallel_map.MatchSchedulersOnline,
-                    health_check_timeout + 500,
+                    parallel_map.WorkerAmount(num_workers),
+                    health_check_timeout + 1000,
                   )
                 let failed = collect_failures(active_slots, results)
                 process.send(pool, HealthCheckResults(failed))
@@ -874,7 +882,7 @@ pub fn simple_query(
     timeout,
     fn(actor) {
       let subj = process.new_subject()
-      process.send(actor, connection_actor.SimpleQuery(sql, subj))
+      process.send(actor, connection_actor.SimpleQuery(sql, timeout, subj))
       subj
     },
     is_simple_socket_error,
