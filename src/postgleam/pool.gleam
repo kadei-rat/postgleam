@@ -47,6 +47,13 @@ pub type PoolMessage {
   HealthCheckResults(failed: List(#(Int, Subject(connection_actor.Message))))
   /// Internal: reconnect a slot
   Reconnect(index: Int)
+  /// Internal: result of an async reconnect attempt. Sent back to the pool
+  /// by the child process spawned from `Reconnect` so the pool isn't blocked
+  /// inside `actor.start` (which does a synchronous TCP + auth handshake).
+  ReconnectResult(
+    index: Int,
+    result: Result(Subject(connection_actor.Message), Nil),
+  )
 }
 
 /// Connection slot state
@@ -370,13 +377,31 @@ fn handle_message(
 
     Reconnect(index) -> {
       case get_slot(state.slots, index) {
+        Ok(Reconnecting(_)) -> {
+          let pool = state.self
+          let config = state.config
+          let registry = state.registry
+          process.spawn(fn() {
+            let result = case
+              connection_actor.start_with_registry(config, registry)
+            {
+              Ok(started) -> Ok(started.data)
+              Error(_) -> Error(Nil)
+            }
+            process.send(pool, ReconnectResult(index, result))
+          })
+          actor.continue(state)
+        }
+        _ -> actor.continue(state)
+      }
+    }
+
+    ReconnectResult(index, result) -> {
+      case get_slot(state.slots, index) {
         Ok(Reconnecting(attempts)) -> {
-          case
-            connection_actor.start_with_registry(state.config, state.registry)
-          {
-            Ok(started) -> {
-              let slots =
-                set_slot(state.slots, index, Active(started.data))
+          case result {
+            Ok(subject) -> {
+              let slots = set_slot(state.slots, index, Active(subject))
               let state = PoolState(..state, slots: slots)
               let state = drain_queue(state)
               actor.continue(state)
