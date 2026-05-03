@@ -62,3 +62,15 @@ pub fn numeric_wrong_type_test() {
   numeric.encode(value.Integer(1))
   |> should.be_error()
 }
+
+pub fn numeric_roundtrip_trailing_zero_fractional_test() {
+  let assert Ok(encoded) = numeric.encode(value.Numeric("5.0"))
+  let assert Ok(value.Numeric(s)) = numeric.decode(encoded)
+  should.equal(s, "5.0")
+}
+
+pub fn numeric_roundtrip_zero_with_scale_test() {
+  let assert Ok(encoded) = numeric.encode(value.Numeric("0.00"))
+  let assert Ok(value.Numeric(s)) = numeric.decode(encoded)
+  should.equal(s, "0.00")
+}

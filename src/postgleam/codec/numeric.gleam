@@ -220,5 +220,5 @@ fn string_length(s: String) -> Int
 @external(erlang, "binary", "part")
 fn string_slice(s: String, start: Int, len: Int) -> String
 
-@external(erlang, "string", "copies")
+@external(erlang, "binary", "copy")
 fn string_repeat(s: String, n: Int) -> String
